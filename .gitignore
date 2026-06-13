@@ -1,0 +1,33 @@
+# 데이터 (대용량 — git에 올리지 않음)
+data/*
+!data/README.md
+
+# 실험 산출물 (oof.npy, submission.csv 등)
+experiments/*
+!experiments/exp_001/
+experiments/exp_001/*
+!experiments/exp_001/config.yaml
+!experiments/exp_001/README.md
+
+# 사전학습 가중치 (대용량)
+weights/*
+!weights/download_weights.py
+!weights/README.md
+
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# 환경/시크릿
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+catboost_info/

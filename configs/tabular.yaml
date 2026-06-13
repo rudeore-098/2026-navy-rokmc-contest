@@ -1,0 +1,29 @@
+# 정형 데이터 설정 — 부스팅 3종
+# 사용: python -m src.train --config configs/tabular.yaml --exp exp_001 --demo
+
+type: tabular
+task: binary            # binary | multiclass | regression
+
+seed: 42
+n_folds: 5
+
+target_col: "target"
+id_col: "id"
+group_col: null
+
+paths:
+  train: "data/train.csv"
+  test: "data/test.csv"
+
+# 모델별 하이퍼파라미터 (비우면 검증된 기본값 사용)
+# Optuna 튜닝 결과를 여기 채워넣으면 그대로 재현된다.
+params_by_kind:
+  lgb:
+    learning_rate: 0.05
+    num_leaves: 31
+  xgb:
+    learning_rate: 0.05
+    max_depth: 6
+  cat:
+    learning_rate: 0.05
+    depth: 6

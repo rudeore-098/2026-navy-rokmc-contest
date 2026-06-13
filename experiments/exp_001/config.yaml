@@ -1,0 +1,16 @@
+# 실험별 설정 스냅샷 (예시)
+# train.py 실행 시 실제 config가 experiments/{exp}/config.json 으로 자동 저장됩니다.
+# 이 파일은 "실험 폴더는 이렇게 구성된다"를 보여주는 예시입니다.
+
+exp_id: exp_001
+type: tabular
+task: binary
+model: LightGBM + XGBoost + CatBoost
+seed: 42
+n_folds: 5
+
+# 노션 실험 DB와 연결: 이 폴더명(exp_001)을 노션 '실험ID'와 맞추면
+# "노션에서 best로 기록된 실험"의 oof.npy를 바로 찾을 수 있습니다.
+notion_link: "EXP-1"
+
+note: "baseline. 산출물은 oof.npy, test_*.npy, submission.csv"

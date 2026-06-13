@@ -1,0 +1,24 @@
+name: comp
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - jupyter
+  - pyyaml
+  - pip:
+      - lightgbm
+      - xgboost
+      - catboost
+      - optuna
+      - librosa
+      - soundfile
+      # GPU 환경에서 비전/음향 딥러닝 시:
+      # - torch
+      # - timm
+      # - transformers
