@@ -1,14 +1,23 @@
 # 버전 완전 고정 — 당일 설치 충돌 방지
-# 이 조합은 실제로 검증된 버전입니다. pip install -r requirements.lock
+# pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu121
 #
-# 주의: 대회 서버의 파이썬/CUDA 버전에 따라 일부 조정이 필요할 수 있습니다.
-#       특히 torch/timm은 서버 CUDA에 맞춰 별도 설치하세요.
+# ★ 이 컨테이너 환경: Python 3.10 / CUDA 12.2 ★
+#   코어 과학 패키지는 'Python 3.10 에서 설치되는 마지막 버전'으로 고정했습니다.
+#   (원래 numpy 2.4.4 / pandas 3.0.2 / scipy 1.17.1 / scikit-learn 1.8.0 은
+#    모두 Python >= 3.11 전용이라 3.10 에서 설치 불가 → 아래 버전으로 교체)
+#
+# 상한 주의 (Python 3.10 유지하는 한 이 위로 올리면 안 됨):
+#   numpy        < 2.3   (2.3 부터 3.10 미지원)
+#   pandas       < 3.0   (3.0 부터 3.11+)
+#   scipy        < 1.16  (1.16 부터 3.11+)
+#   scikit-learn < 1.8   (1.8 부터 3.11+)
+#   torch        cu121 은 2.5.x 까지 (2.6 부터 cu121 빌드 없음)
 
-# 코어
-numpy==2.4.4
-pandas==3.0.2
-scipy==1.17.1
-scikit-learn==1.8.0
+# 코어  ── Python 3.10 호환 상한으로 고정 ──
+numpy==2.2.6           # 2.2.x 마지막 (3.10~3.13). librosa→numba 호환도 2.4 보다 안전
+pandas==2.3.3          # 2.x 마지막 (3.9~3.14)
+scipy==1.15.3          # 1.15.x 마지막 (3.10~3.13)
+scikit-learn==1.7.2    # 1.7.x 마지막 (3.10~3.14)
 joblib==1.5.3
 threadpoolctl==3.6.0
 
@@ -28,7 +37,10 @@ pyyaml==6.0.3
 librosa==0.11.0
 soundfile==0.14.0
 
-# ── GPU 딥러닝 (비전/음향) — 서버 CUDA에 맞춰 설치 ──
-# torch (CUDA 버전 맞춰 공식 사이트에서)
-# timm==1.0.x
-# transformers==4.4x.x   # AST 등 음향 특화 모델
+# ── GPU 딥러닝 (비전/음향) — CUDA 12.2 대응 (cu121 휠) ──
+# 설치 시 반드시: --extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+timm==1.0.27              # 최신 1.0.x
+transformers==4.49.0      # 4.4x.x 라인의 마지막 (AST 등 음향 특화 모델). 현재 메인라인은 5.x
