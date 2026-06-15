@@ -220,6 +220,99 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
     n_cls   = len(SHIP_TYPE_TO_IDX)  # 4
     n_folds = cfg.get("n_folds", 5)
 
+    # ── 단일 학습 (n_folds=1): 전체 train.csv → task1_val.csv 검증 ─────────────
+    if n_folds == 1:
+        logger.info("=== Single Fold (no CV): train 전체 → val.csv 검증 ===")
+        val_df_ext, val_audio_ext = load_task1(cfg, "val", demo=demo)
+        va_labels_ext = val_df_ext["ship_type"].map(SHIP_TYPE_TO_IDX).values
+
+        tr_loader = _make_loader(train_df, audio_dir, cfg, demo, shuffle=True)
+        va_loader = _make_loader(val_df_ext, val_audio_ext, cfg, demo)
+
+        cnts = np.bincount(labels, minlength=n_cls).astype(float)
+        w    = torch.tensor((cnts.sum() / (n_cls * cnts)).clip(0.1, 10),
+                            dtype=torch.float32, device=device)
+        criterion = FocalLoss(gamma=2.0, weight=w,
+                              label_smoothing=cfg.get("label_smoothing", 0.0))
+        model = create_audio_model(cfg, n_cls).to(device)
+
+        freeze_epochs     = cfg.get("freeze_epochs", 0)
+        unfreeze_lr_scale = cfg.get("unfreeze_lr_scale", 0.1)
+        total_epochs      = cfg["epochs"]
+        base_lr           = cfg["lr"]
+        patience          = cfg.get("patience", 5)
+
+        if freeze_epochs > 0:
+            _freeze_backbone(model)
+            logger.info(f"  [Phase 1] 백본 freeze — {freeze_epochs} epochs")
+            optimizer = _make_optimizer(model, base_lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=freeze_epochs, eta_min=base_lr * 0.01)
+        else:
+            optimizer = _make_optimizer(model, base_lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs, eta_min=base_lr * 0.01)
+
+        scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+        best_score, patience_cnt = -np.inf, 0
+
+        epoch_bar = tqdm(range(total_epochs), desc="Single", unit="ep", dynamic_ncols=True)
+        for epoch in epoch_bar:
+            if freeze_epochs > 0 and epoch == freeze_epochs:
+                _unfreeze_backbone(model)
+                optimizer = _make_optimizer(model, base_lr,
+                                            backbone_lr_scale=unfreeze_lr_scale)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=total_epochs - freeze_epochs, eta_min=base_lr * 0.01)
+                best_score, patience_cnt = -np.inf, 0
+                logger.info(f"  [Phase 2] 백본 unfreeze")
+
+            loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device,
+                                mixup_p=cfg.get("mixup_p", 0.0),
+                                mixup_alpha=cfg.get("mixup_alpha", 0.4),
+                                desc="  train")
+            va_preds, _ = _eval_epoch(model, va_loader, device, desc="  val")
+            score = get_metric("multiclass", va_labels_ext, va_preds)
+            scheduler.step()
+            lr_now = scheduler.get_last_lr()[0]
+            epoch_bar.set_postfix(loss=f"{loss:.4f}", F1=f"{score:.4f}",
+                                  best=f"{best_score:.4f}" if best_score > -np.inf else "-",
+                                  lr=f"{lr_now:.2e}")
+            logger.info(f"  ep {epoch+1:3d}/{total_epochs} | loss={loss:.4f} "
+                        f"| MacroF1={score:.4f} | lr={lr_now:.2e}")
+
+            if score > best_score:
+                best_score, patience_cnt = score, 0
+                torch.save(model.state_dict(), os.path.join(exp_dir, "model_fold0.pt"))
+            else:
+                patience_cnt += 1
+                if patience_cnt >= patience:
+                    logger.info(f"  early stop at epoch {epoch + 1}")
+                    epoch_bar.close()
+                    break
+
+        logger.info(f"best val MacroF1: {best_score:.5f}")
+
+        # test 예측
+        test_df, test_audio = load_task1(cfg, "test", demo=demo)
+        tta_n = cfg.get("tta_n", 1)
+        model.load_state_dict(torch.load(os.path.join(exp_dir, "model_fold0.pt"),
+                                         map_location=device, weights_only=True))
+        val_preds  = _predict_tta(model, _make_loader(val_df_ext, val_audio_ext,
+                                                       cfg, demo, is_test=True),
+                                  device, n_tta=tta_n, desc="  val")
+        test_preds = _predict_tta(model, _make_loader(test_df, test_audio,
+                                                       cfg, demo, is_test=True),
+                                  device, n_tta=tta_n, desc="  test")
+
+        # oof.npy는 앙상블 호환을 위해 val 예측으로 대체 (단일 fold이므로)
+        np.save(os.path.join(exp_dir, "oof.npy"),      va_preds)
+        np.save(os.path.join(exp_dir, "y_true.npy"),   va_labels_ext)
+        np.save(os.path.join(exp_dir, "val_pred.npy"), val_preds)
+        np.save(os.path.join(exp_dir, "test_pred.npy"), test_preds)
+        return {"oof_macro_f1": best_score, "val_macro_f1": best_score}
+
+    # ── KFold 학습 ──────────────────────────────────────────────────────────────
     folder = get_folder("multiclass", n_folds, cfg["seed"], group=True)
     oof    = np.zeros((len(train_df), n_cls), dtype=np.float32)
 
