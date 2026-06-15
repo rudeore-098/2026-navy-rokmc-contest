@@ -1,3 +1,4 @@
+from tqdm import tqdm
 """공통 학습 루프 — config를 받아 task별로 분기.
 
 핵심 산출물: OOF 예측(oof.npy)과 test 예측. 이게 앙상블의 입력이 된다.
@@ -9,6 +10,7 @@
 import os
 import argparse
 import numpy as np
+import torch
 
 from src.utils.seed import seed_everything
 from src.utils.metrics import get_metric, metric_name
@@ -182,7 +184,13 @@ def train_audio(cfg, exp_dir, demo, logger):
                         batch_size=cfg["batch_size"], shuffle=False, num_workers=nw)
 
         model = create_audio_model(cfg["model_name"], n_class, cfg.get("pretrained", True)).to(dev)
-        crit = nn.CrossEntropyLoss(weight=class_weights(y[tri], n_class).to(dev))
+        import torch
+    def effective_class_weights(y, n_class, beta=0.999):
+        counts = np.bincount(y, minlength=n_class).astype(float)
+        effective_num = 1.0 - np.power(beta, counts)
+        weights = (1.0 - beta) / effective_num
+        weights = weights / weights.sum() * n_class  # 평균 1로 정규화
+        return torch.tensor(weights, dtype=torch.float32)
         opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-5))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg["epochs"])
         scaler = torch.cuda.amp.GradScaler(enabled=(dev == "cuda"))
@@ -190,7 +198,7 @@ def train_audio(cfg, exp_dir, demo, logger):
         best_f1, best_oof, best_state = -1, None, None
         for ep in range(cfg["epochs"]):
             model.train()
-            for mel, ais, yy in tl:
+            for mel, ais, yy in tqdm(tl, desc=f"fold{fold} ep{ep+1}", leave=False):
                 mel, ais, yy = mel.to(dev), ais.to(dev), yy.to(dev)
                 opt.zero_grad()
                 with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
