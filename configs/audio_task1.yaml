@@ -35,17 +35,26 @@ n_fft:       2048
 hop_length:  512
 f_min:       50
 f_max:       16000
+hp_cutoff:   20.0           # DC/초저주파 드리프트 제거 (highpass). precompute 와 공유
+
+# mel npy 사전생성 사용 여부 (scripts/precompute_mel.py)
+#   true  : mel_dir 의 .npy 를 읽음 (사전생성 필요, 학습 빠름)
+#   false : WAV 를 매번 torchaudio 로 변환 (사전생성 불필요)
+use_npy:  false
+mel_dir:  "data/mel_npy"    # precompute_mel.py 출력 폴더 (use_npy=true 일 때)
 
 # ── 모델 ──────────────────────────────────────────────────────────────────────
 model_name: "eca_nfnet_l0"   # 음향 대회 단골. 앙상블 시 tf_efficientnet_b2_ns 등으로 교체
 in_chans:   1
 pretrained: true
 
-# AIS 피처 차원: sog(1) + sin/cos×cog(2) + sin/cos×heading(2) = 5
-ais_dim: 5
+# AIS 피처 차원 (src/models/audio.py build_ais_features):
+#   log1p(sog) + cos/sin×cog(2) + cos/sin×heading(2) + is_stop + head_missing + sog_invalid = 8
+ais_dim: 8
 
 # ── 학습 ──────────────────────────────────────────────────────────────────────
-epochs:      20
-batch_size:  32
-lr:          1.0e-3
-num_workers: 4
+epochs:       20
+batch_size:   32
+lr:           1.0e-3
+weight_decay: 1.0e-5
+num_workers:  4

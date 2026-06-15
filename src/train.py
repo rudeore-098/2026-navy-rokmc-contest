@@ -96,6 +96,107 @@ def train_vision(cfg, exp_dir, demo, logger):
     )
 
 
+def train_audio(cfg, exp_dir, demo, logger):
+    """음향 CNN + AIS 융합 학습 → OOF/test 예측 저장 (tabular 과 동일한 OOF 컨벤션).
+
+    - ship_id GroupKFold (배 누수 차단)
+    - class-weighted CrossEntropy (Macro F1 / 소수클래스 C_Passenger 대응)
+    - mel npy 우선 로드(scripts/precompute_mel.py), 없으면 WAV fallback
+    - fold 내 best Macro F1 에폭의 가중치를 복원해 OOF·test 예측을 동일 체크포인트로 통일
+    task 는 'multiclass' (= Macro F1) 를 사용. GPU(torch/timm/torchaudio) 환경 필요.
+    """
+    import copy
+    import pandas as pd
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+    from src.data.loaders import SHIP_TYPE_TO_IDX
+    from src.models.audio import (
+        build_ais_features, make_dataset, create_audio_model, class_weights)
+
+    if demo:
+        logger.info("audio 데모는 생략 — 실제 데이터(mel npy/WAV)로 실행하세요.")
+        raise NotImplementedError("audio 학습은 실제 데이터 + GPU 환경에서 실행")
+
+    task = cfg["task"]            # 'multiclass' → Macro F1
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    cls2idx = SHIP_TYPE_TO_IDX
+    n_class = len(cls2idx)
+
+    train = pd.read_csv(cfg["paths"]["train"])
+    test  = pd.read_csv(cfg["paths"]["task1_test"])
+    y = train[cfg["target_col"]].map(cls2idx).values
+    groups = train[cfg["group_col"]].values
+    tr_ais, te_ais = build_ais_features(train), build_ais_features(test)
+
+    folder = get_folder(task, cfg["n_folds"], cfg["seed"], group=True)
+
+    oof = np.zeros((len(train), n_class))
+    test_pred = np.zeros((len(test), n_class))
+    cfg_tr = {**cfg, "_audio_dir": cfg["paths"]["train_audio"]}
+    cfg_te = {**cfg, "_audio_dir": cfg["paths"]["task1_audio"]}
+
+    for fold, (tri, vai) in enumerate(cv_split(folder, train, y, groups)):
+        tl = DataLoader(make_dataset(train.iloc[tri], tr_ais[tri], cfg_tr, y[tri], train=True),
+                        batch_size=cfg["batch_size"], shuffle=True,
+                        num_workers=cfg.get("num_workers", 4), pin_memory=True, drop_last=True)
+        vl = DataLoader(make_dataset(train.iloc[vai], tr_ais[vai], cfg_tr, y[vai], train=False),
+                        batch_size=cfg["batch_size"], shuffle=False,
+                        num_workers=cfg.get("num_workers", 4))
+
+        model = create_audio_model(cfg["model_name"], n_class, cfg.get("pretrained", True)).to(dev)
+        crit = nn.CrossEntropyLoss(weight=class_weights(y[tri], n_class).to(dev))
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg.get("weight_decay", 1e-5))
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg["epochs"])
+        scaler = torch.cuda.amp.GradScaler(enabled=(dev == "cuda"))
+
+        best_f1, best_oof, best_state = -1, None, None
+        for ep in range(cfg["epochs"]):
+            model.train()
+            for mel, ais, yy in tl:
+                mel, ais, yy = mel.to(dev), ais.to(dev), yy.to(dev)
+                opt.zero_grad()
+                with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
+                    loss = crit(model(mel, ais), yy)
+                scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
+            sched.step()
+            # fold val 예측
+            model.eval(); probs = []
+            with torch.no_grad():
+                for mel, ais, _ in vl:
+                    with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
+                        probs.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
+            probs = np.concatenate(probs)
+            f1 = get_metric(task, y[vai], probs)
+            logger.info(f"[fold{fold}] ep{ep+1:02d} {metric_name(task)}={f1:.4f}")
+            if f1 > best_f1:
+                best_f1, best_oof = f1, probs
+                best_state = copy.deepcopy(model.state_dict())   # best 에폭 가중치 보관
+        oof[vai] = best_oof
+
+        # OOF 와 동일한 best 체크포인트로 test 예측 (last 에폭 아님)
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        tel = DataLoader(make_dataset(test, te_ais, cfg_te, None, train=False),
+                         batch_size=cfg["batch_size"], shuffle=False,
+                         num_workers=cfg.get("num_workers", 4))
+        model.eval(); tp = []
+        with torch.no_grad():
+            for mel, ais in tel:
+                with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
+                    tp.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
+        test_pred += np.concatenate(tp) / cfg["n_folds"]
+        torch.save(model.state_dict(), os.path.join(exp_dir, f"audio_fold{fold}.pt"))
+
+    score = get_metric(task, y, oof)
+    logger.info(f"[audio] OOF {metric_name(task)}: {score:.5f}")
+    np.save(os.path.join(exp_dir, "oof_audio.npy"), oof)
+    np.save(os.path.join(exp_dir, "oof.npy"), oof)
+    np.save(os.path.join(exp_dir, "test_audio.npy"), test_pred)
+    np.save(os.path.join(exp_dir, "y_true.npy"), y)
+    return {"audio": score}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
@@ -117,6 +218,8 @@ def main():
         results = train_tabular(cfg, exp_dir, args.demo, logger)
     elif task_type == "vision":
         results = train_vision(cfg, exp_dir, args.demo, logger)
+    elif task_type == "audio":
+        results = train_audio(cfg, exp_dir, args.demo, logger)
     else:
         raise ValueError(f"unknown type: {task_type}")
 
