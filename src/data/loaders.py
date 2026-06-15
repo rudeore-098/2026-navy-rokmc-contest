@@ -124,7 +124,14 @@ class AudioDataset(_TorchDataset):
             return np.random.rand(self.n_mels, time_frames).astype(np.float32)
 
         npy_path = os.path.join(self.cache_dir, filename.replace(".wav", ".npy"))
-        return np.load(npy_path)
+        try:
+            return np.load(npy_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"캐시 파일이 없습니다: {npy_path}\n"
+                "학습 전 mel 변환을 먼저 실행하세요:\n"
+                "  python -m src.data.mel --config configs/audio_task1.yaml"
+            ) from None
 
     def __getitem__(self, idx):
         import torch
