@@ -86,6 +86,8 @@ class ASTWrapper(nn.Module):
         from transformers import ASTModel
         self.ast = ASTModel.from_pretrained(pretrained)
         feat_dim = self.ast.config.hidden_size  # 768 (base model)
+        # 사전학습 위치 임베딩이 기대하는 시간 프레임 수 (AudioSet 10s → 1024)
+        self._time_steps = self.ast.config.max_length
 
         self.ais_proj = nn.Linear(ais_dim, 32) if ais_dim > 0 else None
         in_dim = feat_dim + (32 if ais_dim > 0 else 0)
@@ -100,7 +102,11 @@ class ASTWrapper(nn.Module):
 
     def forward(self, spec, ais=None, return_embedding: bool = False):
         # spec: (B, 1, n_mels, T) → AST expects (B, T, n_mels)
-        x_input = spec.squeeze(1).transpose(1, 2)                  # (B, 313, 128)
+        x_input = spec.squeeze(1).transpose(1, 2)          # (B, T, 128)
+        # 사전학습 위치 임베딩과 크기를 맞추기 위해 시간 축 패딩
+        if x_input.shape[1] < self._time_steps:
+            pad_len = self._time_steps - x_input.shape[1]
+            x_input = F.pad(x_input, (0, 0, 0, pad_len))  # (B, 1024, 128)
         x = self.ast(input_values=x_input).last_hidden_state[:, 0, :]  # CLS (B, 768)
         if self.ais_proj is not None and ais is not None:
             x = torch.cat([x, F.relu(self.ais_proj(ais))], dim=1)

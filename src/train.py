@@ -4,12 +4,12 @@
 
 사용법:
     python -m src.train --config configs/audio_task1.yaml --exp exp_t1_001
-    python -m src.train --config configs/audio_task2.yaml --exp exp_t2_001
     python -m src.train --config configs/audio_task1.yaml --exp smoke --demo
 """
 import os
 import argparse
 import numpy as np
+from tqdm import tqdm
 
 from src.utils.seed import seed_everything
 from src.utils.metrics import get_metric
@@ -45,11 +45,12 @@ def spec_augment(spec, T: int = 40, F: int = 20, num_T: int = 2, num_F: int = 2)
 
 # ── 공통 루프 헬퍼 ────────────────────────────────────────────────────────────
 
-def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=True):
+def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=True, desc="train"):
     import torch
     model.train()
     total_loss = 0.0
-    for spec, ais, label in loader:
+    bar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for spec, ais, label in bar:
         spec, ais, label = spec.to(device), ais.to(device), label.to(device)
         if augment:
             spec = spec_augment(spec)
@@ -62,16 +63,17 @@ def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=Tr
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item()
+        bar.set_postfix(loss=f"{loss.item():.4f}")
     return total_loss / max(len(loader), 1)
 
 
-def _eval_epoch(model, loader, device):
+def _eval_epoch(model, loader, device, desc="val"):
     """Returns (preds: ndarray N×C, labels: ndarray N)."""
     import torch
     model.eval()
     preds, labels = [], []
     with torch.no_grad():
-        for spec, ais, label in loader:
+        for spec, ais, label in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
             spec, ais = spec.to(device), ais.to(device)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(spec, ais)
@@ -80,13 +82,13 @@ def _eval_epoch(model, loader, device):
     return np.concatenate(preds), np.concatenate(labels)
 
 
-def _predict(model, loader, device):
+def _predict(model, loader, device, desc="predict"):
     """Returns softmax probs ndarray N×C (no labels)."""
     import torch
     model.eval()
     preds = []
     with torch.no_grad():
-        for batch in loader:
+        for batch in tqdm(loader, desc=desc, leave=False, dynamic_ncols=True):
             spec, ais = batch[0].to(device), batch[1].to(device)
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(spec, ais)
@@ -98,11 +100,15 @@ def _make_loader(df, audio_dir, cfg, demo, is_test=False,
                  label_col=None, label_map=None, shuffle=False):
     from torch.utils.data import DataLoader
     from src.data.loaders import AudioDataset
+
+    cache_dir = cfg.get("cache_dir", "data/spec_cache")
     ds = AudioDataset(df, audio_dir, cfg, is_test=is_test, demo=demo,
-                      label_col=label_col, label_map=label_map)
+                      label_col=label_col, label_map=label_map,
+                      cache_dir=cache_dir)
     bs = cfg["batch_size"] if not is_test else cfg["batch_size"] * 2
+    nw = cfg.get("num_workers", 4)
     return DataLoader(ds, batch_size=bs, shuffle=shuffle,
-                      num_workers=cfg.get("num_workers", 0), pin_memory=True)
+                      num_workers=nw, pin_memory=True)
 
 
 # ── Task 1: 선종 분류 (GroupKFold + Focal Loss + OOF) ────────────────────────
@@ -147,13 +153,22 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         best_score, best_oof_fold, patience_cnt = -np.inf, None, 0
         patience = cfg.get("patience", 5)
 
-        for epoch in range(cfg["epochs"]):
-            loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device)
-            va_preds, va_labels = _eval_epoch(model, va_loader, device)
+        epoch_bar = tqdm(range(cfg["epochs"]), desc=f"Fold {fold+1}/{n_folds}",
+                         unit="ep", dynamic_ncols=True)
+        for epoch in epoch_bar:
+            loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device,
+                                desc="  train")
+            va_preds, va_labels = _eval_epoch(model, va_loader, device, desc="  val")
             score = get_metric("multiclass", va_labels, va_preds)
             scheduler.step()
+            lr_now = scheduler.get_last_lr()[0]
+            epoch_bar.set_postfix(
+                loss=f"{loss:.4f}", F1=f"{score:.4f}",
+                best=f"{best_score:.4f}" if best_score > -np.inf else "-",
+                lr=f"{lr_now:.2e}",
+            )
             logger.info(f"  ep {epoch+1:3d}/{cfg['epochs']} | loss={loss:.4f} "
-                        f"| MacroF1={score:.4f} | lr={scheduler.get_last_lr()[0]:.2e}")
+                        f"| MacroF1={score:.4f} | lr={lr_now:.2e}")
 
             if score > best_score:
                 best_score, best_oof_fold, patience_cnt = score, va_preds.copy(), 0
@@ -163,6 +178,7 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
                 patience_cnt += 1
                 if patience_cnt >= patience:
                     logger.info(f"  early stop at epoch {epoch + 1}")
+                    epoch_bar.close()
                     break
 
         oof[va_idx] = best_oof_fold
@@ -180,13 +196,16 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
     test_preds = np.zeros((len(test_df), n_cls), dtype=np.float32)
     loaded = 0
 
-    for fold in range(n_folds):
+    model = create_audio_model(cfg, n_cls).to(device)
+    for fold in tqdm(range(n_folds), desc="앙상블 예측", unit="fold", dynamic_ncols=True):
         ckpt = os.path.join(exp_dir, f"model_fold{fold}.pt")
         if not os.path.exists(ckpt):
             continue
         model.load_state_dict(torch.load(ckpt, map_location=device))
-        val_preds  += _predict(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True), device)
-        test_preds += _predict(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True), device)
+        val_preds  += _predict(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
+                               device, desc=f"  fold{fold} val")
+        test_preds += _predict(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
+                               device, desc=f"  fold{fold} test")
         loaded += 1
 
     if loaded:
@@ -199,69 +218,6 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
                            val_df["ship_type"].map(SHIP_TYPE_TO_IDX).values, val_preds)
     logger.info(f"t1_val MacroF1 (ensemble): {val_score:.5f}")
     return {"oof_macro_f1": oof_score, "val_macro_f1": val_score}
-
-
-# ── Task 2: 선박 ID 검색 (362-class 분류 → 임베딩 추출용) ─────────────────────
-
-def train_audio_task2(cfg, exp_dir, demo, logger):
-    """362-class audio-only 임베딩 모델 학습. 검색은 infer_retrieval.py에서."""
-    import torch
-    import pandas as pd
-    from src.models.audio import create_audio_model
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"device: {device}")
-
-    train_df  = pd.read_csv(cfg["paths"]["train"])
-    audio_dir = cfg["paths"]["train_audio"]
-
-    ship_ids = sorted(train_df["ship_id"].unique())
-    id_map   = {sid: i for i, sid in enumerate(ship_ids)}
-    n_cls    = len(ship_ids)
-    np.save(os.path.join(exp_dir, "ship_id_map.npy"), id_map)
-    logger.info(f"Task2: {n_cls} ships, {len(train_df)} clips, audio-only")
-
-    rng       = np.random.default_rng(cfg["seed"])
-    val_ships = set(rng.choice(ship_ids, size=int(n_cls * 0.2), replace=False).tolist())
-    tr_df = train_df[~train_df["ship_id"].isin(val_ships)].reset_index(drop=True)
-    va_df = train_df[ train_df["ship_id"].isin(val_ships)].reset_index(drop=True)
-
-    tr_loader = _make_loader(tr_df, audio_dir, cfg, demo, shuffle=True,
-                             label_col="ship_id", label_map=id_map)
-    va_loader = _make_loader(va_df, audio_dir, cfg, demo,
-                             label_col="ship_id", label_map=id_map)
-
-    task2_cfg = {**cfg, "ais_dim": 0}   # Task2: AIS 없음
-    model = create_audio_model(task2_cfg, n_cls).to(device)
-
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
-    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
-    best_acc, patience_cnt = -np.inf, 0
-    patience = cfg.get("patience", 5)
-
-    for epoch in range(cfg["epochs"]):
-        loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device)
-        va_preds, va_labels = _eval_epoch(model, va_loader, device)
-        acc = (va_preds.argmax(1) == va_labels).mean()
-        scheduler.step()
-        logger.info(f"  ep {epoch+1:3d}/{cfg['epochs']} | loss={loss:.4f} "
-                    f"| val_acc={acc:.4f} | lr={scheduler.get_last_lr()[0]:.2e}")
-
-        if acc > best_acc:
-            best_acc, patience_cnt = acc, 0
-            torch.save(model.state_dict(), os.path.join(exp_dir, "model_task2.pt"))
-        else:
-            patience_cnt += 1
-            if patience_cnt >= patience:
-                logger.info(f"  early stop at epoch {epoch + 1}")
-                break
-
-    logger.info(f"Task2 best val acc: {best_acc:.5f}")
-    return {"val_acc": best_acc}
 
 
 # ── 엔트리포인트 ───────────────────────────────────────────────────────────────
@@ -286,8 +242,6 @@ def main():
 
     if task == "multiclass":
         results = train_audio_task1(cfg, exp_dir, args.demo, logger)
-    elif task == "retrieval":
-        results = train_audio_task2(cfg, exp_dir, args.demo, logger)
     else:
         raise ValueError(f"unknown task: {task}")
 

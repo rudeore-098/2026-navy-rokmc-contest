@@ -31,3 +31,4 @@ env/
 .DS_Store
 Thumbs.db
 catboost_info/
+spec_cache.tar.gz

@@ -44,33 +44,3 @@ def to_submission(task: str, pred):
     if task == "multiclass":
         return pred.argmax(axis=1)
     return pred  # binary는 확률, regression은 값 그대로 (대회 양식에 맞게 조정)
-
-
-# ── Task 2: 선박 ID 검색 ────────────────────────────────────────────────────
-
-def retrieval_score(y_true_ids, top5_pred_ids):
-    """Task 2 평가: Recall@1×0.5 + Recall@3×0.3 + Recall@5×0.2
-
-    Parameters
-    ----------
-    y_true_ids    : list[int]        정답 ship_id (쿼리 수 N)
-    top5_pred_ids : list[list[int]]  예측 Top-5 ship_id 리스트 (N × 5)
-
-    Returns
-    -------
-    score : float  (0~1, 클수록 좋음)
-    """
-    n = len(y_true_ids)
-    r1 = sum(t == p[0]    for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    r3 = sum(t in p[:3]   for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    r5 = sum(t in p[:5]   for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    return r1 * 0.5 + r3 * 0.3 + r5 * 0.2
-
-
-def recall_at_k(y_true_ids, top5_pred_ids):
-    """Recall@1, @3, @5를 각각 반환 (로깅용)."""
-    n = len(y_true_ids)
-    r1 = sum(t == p[0]  for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    r3 = sum(t in p[:3] for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    r5 = sum(t in p[:5] for t, p in zip(y_true_ids, top5_pred_ids)) / n
-    return {"R@1": r1, "R@3": r3, "R@5": r5}
