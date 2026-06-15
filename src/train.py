@@ -54,7 +54,7 @@ def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=Tr
         if augment:
             spec = spec_augment(spec)
         optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             loss = criterion(model(spec, ais), label)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -73,7 +73,7 @@ def _eval_epoch(model, loader, device):
     with torch.no_grad():
         for spec, ais, label in loader:
             spec, ais = spec.to(device), ais.to(device)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(spec, ais)
             preds.append(torch.softmax(logits, dim=1).cpu().numpy())
             labels.append(label.numpy())
@@ -88,7 +88,7 @@ def _predict(model, loader, device):
     with torch.no_grad():
         for batch in loader:
             spec, ais = batch[0].to(device), batch[1].to(device)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
                 logits = model(spec, ais)
             preds.append(torch.softmax(logits, dim=1).cpu().numpy())
     return np.concatenate(preds)
@@ -142,7 +142,7 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
-        scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+        scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
         best_score, best_oof_fold, patience_cnt = -np.inf, None, 0
         patience = cfg.get("patience", 5)
@@ -238,7 +238,7 @@ def train_audio_task2(cfg, exp_dir, demo, logger):
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
 
     best_acc, patience_cnt = -np.inf, 0
     patience = cfg.get("patience", 5)

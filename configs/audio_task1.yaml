@@ -48,4 +48,4 @@ ais_dim: 5
 epochs:      20
 batch_size:  32
 lr:          1.0e-3
-num_workers: 4
+num_workers: 2

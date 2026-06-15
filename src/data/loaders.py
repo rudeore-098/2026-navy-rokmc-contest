@@ -236,16 +236,21 @@ class AudioDataset(_TorchDataset):
         row = self.df.iloc[idx]
 
         # ── 스펙트로그램 ──────────────────────────────────────────────────────
+        time_frames = int(self.sr * self.duration) // self.hop_length + 1
         if self.demo:
-            time_frames = int(self.sr * self.duration) // self.hop_length + 1
             spec = np.random.rand(self.n_mels, time_frames).astype(np.float32)
         else:
             path = os.path.join(self.audio_dir, row["filename"])
-            spec = wav_to_melspec(
-                path, sr=self.sr, duration=self.duration,
-                n_mels=self.n_mels, n_fft=self.n_fft, hop_length=self.hop_length,
-                f_min=self.f_min, f_max=self.f_max,
-            )
+            try:
+                spec = wav_to_melspec(
+                    path, sr=self.sr, duration=self.duration,
+                    n_mels=self.n_mels, n_fft=self.n_fft, hop_length=self.hop_length,
+                    f_min=self.f_min, f_max=self.f_max,
+                )
+            except Exception as e:
+                import warnings
+                warnings.warn(f"Failed to load {path}: {e}. Returning zeros.")
+                spec = np.zeros((self.n_mels, time_frames), dtype=np.float32)
         spec_tensor = torch.from_numpy(spec).unsqueeze(0)  # (1, n_mels, time)
 
         # ── AIS 피처 ─────────────────────────────────────────────────────────

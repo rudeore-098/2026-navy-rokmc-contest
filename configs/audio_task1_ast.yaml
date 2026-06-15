@@ -43,5 +43,5 @@ embed_dim:     512
 epochs:      20
 batch_size:  16    # Transformer는 메모리 더 사용
 lr:          5.0e-5
-num_workers: 4
+num_workers: 2
 patience:    5
