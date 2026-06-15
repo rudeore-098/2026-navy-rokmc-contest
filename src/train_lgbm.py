@@ -58,6 +58,89 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
+def tune_lgbm_ais(cfg, exp_dir, logger, n_trials=100):
+    """Optuna로 LightGBM 하이퍼파라미터 탐색. OOF MacroF1 최대화.
+
+    탐색 파라미터:
+        learning_rate, num_leaves, max_depth, min_child_samples,
+        feature_fraction, bagging_fraction, bagging_freq, lambda_l1, lambda_l2
+
+    Returns
+    -------
+    best_params : dict  (lgbm 파라미터만, objective/num_class 제외)
+    best_score  : float (OOF MacroF1)
+    """
+    import optuna
+    from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    train_df = pd.read_csv(cfg["paths"]["train"])
+    labels   = train_df["ship_type"].map(SHIP_TYPE_TO_IDX).values
+    groups   = train_df["ship_id"].values
+    n_cls    = len(SHIP_TYPE_TO_IDX)
+    n_folds  = cfg.get("n_folds", 5)
+    es_rounds = cfg.get("early_stopping_rounds", 50)
+
+    sog_log  = np.log1p(np.clip(train_df["sog"].astype(float).values, 0, 30))
+    sog_mean = float(sog_log.mean())
+    sog_std  = float(sog_log.std() + 1e-6)
+    X = encode_ais(train_df, sog_mean, sog_std)
+
+    folder = get_folder("multiclass", n_folds, cfg["seed"], group=True)
+
+    def objective(trial):
+        params = {
+            "objective":          "multiclass",
+            "num_class":          n_cls,
+            "n_estimators":       2000,
+            "learning_rate":      trial.suggest_float("learning_rate",     0.01, 0.3,  log=True),
+            "num_leaves":         trial.suggest_int(  "num_leaves",        16,   256),
+            "max_depth":          trial.suggest_int(  "max_depth",         3,    10),
+            "min_child_samples":  trial.suggest_int(  "min_child_samples", 5,    100),
+            "feature_fraction":   trial.suggest_float("feature_fraction",  0.5,  1.0),
+            "bagging_fraction":   trial.suggest_float("bagging_fraction",  0.5,  1.0),
+            "bagging_freq":       trial.suggest_int(  "bagging_freq",      1,    10),
+            "lambda_l1":          trial.suggest_float("lambda_l1",         0.0,  10.0),
+            "lambda_l2":          trial.suggest_float("lambda_l2",         0.0,  10.0),
+            "class_weight":       "balanced",
+            "random_state":       cfg.get("seed", 42),
+            "n_jobs":             -1,
+            "verbose":            -1,
+        }
+        oof = np.zeros((len(train_df), n_cls), dtype=np.float32)
+        for _, (tr_idx, va_idx) in enumerate(cv_split(folder, train_df, labels, groups)):
+            clf = LGBMClassifier(**params)
+            clf.fit(
+                X[tr_idx], labels[tr_idx],
+                eval_set=[(X[va_idx], labels[va_idx])],
+                eval_metric="multi_logloss",
+                callbacks=[early_stopping(es_rounds, verbose=False), log_evaluation(0)],
+            )
+            oof[va_idx] = clf.predict_proba(X[va_idx])
+        return get_metric("multiclass", labels, oof)
+
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.TPESampler(seed=cfg.get("seed", 42)),
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best_params = study.best_params
+    best_score  = study.best_value
+    logger.info(f"튜닝 완료: best OOF MacroF1 = {best_score:.5f}")
+    logger.info(f"best params: {best_params}")
+
+    import yaml
+    best_path = os.path.join(exp_dir, "best_params.yaml")
+    with open(best_path, "w", encoding="utf-8") as f:
+        yaml.dump({"oof_macro_f1": best_score, "lgbm": best_params}, f,
+                  allow_unicode=True, default_flow_style=False)
+    logger.info(f"저장: {best_path}")
+
+    return best_params, best_score
+
+
 def train_lgbm_ais(cfg, exp_dir, logger):
     from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 
@@ -146,8 +229,12 @@ def train_lgbm_ais(cfg, exp_dir, logger):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--exp",    default="exp_lgbm_001")
+    ap.add_argument("--config",    required=True)
+    ap.add_argument("--exp",       default="exp_lgbm_001")
+    ap.add_argument("--tune",      action="store_true",
+                    help="Optuna로 하이퍼파라미터 탐색 후 best params로 학습")
+    ap.add_argument("--n-trials",  type=int, default=100,
+                    help="Optuna 탐색 횟수 (--tune 시 사용, 기본 100)")
     args = ap.parse_args()
 
     cfg    = load_config(args.config)
@@ -158,6 +245,22 @@ def main():
     os.makedirs(exp_dir, exist_ok=True)
 
     logger.info(f"=== LightGBM AIS-only | exp={args.exp} ===")
+
+    if args.tune:
+        logger.info(f"[튜닝 모드] Optuna {args.n_trials} trials 시작...")
+        best_params, best_score = tune_lgbm_ais(cfg, exp_dir, logger, n_trials=args.n_trials)
+        # 탐색된 best params로 cfg 업데이트 (고정값 유지)
+        cfg.setdefault("lgbm", {}).update(best_params)
+        cfg["lgbm"].update({
+            "objective":    "multiclass",
+            "num_class":    len(SHIP_TYPE_TO_IDX),
+            "n_estimators": 2000,
+            "class_weight": "balanced",
+            "n_jobs":       -1,
+            "verbose":      -1,
+        })
+        logger.info(f"[튜닝 완료] best OOF={best_score:.5f} → best params로 학습 시작")
+
     results = train_lgbm_ais(cfg, exp_dir, logger)
 
     log_experiment(
