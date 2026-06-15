@@ -45,3 +45,8 @@ batch_size:  16    # Transformer는 메모리 더 사용
 lr:          5.0e-5
 num_workers: 2
 patience:    5
+
+mixup_p:         0.5
+mixup_alpha:     0.4
+label_smoothing: 0.1
+tta_n:           3

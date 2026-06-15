@@ -10,13 +10,16 @@ class FocalLoss(nn.Module):
     weight: per-class tensor for additional imbalance correction.
     """
 
-    def __init__(self, gamma: float = 2.0, weight=None):
+    def __init__(self, gamma: float = 2.0, weight=None, label_smoothing: float = 0.0):
         super().__init__()
         self.gamma = gamma
         self.weight = weight
+        self.label_smoothing = label_smoothing
 
     def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, weight=self.weight, reduction="none")
+        ce = F.cross_entropy(logits, targets, weight=self.weight,
+                             label_smoothing=self.label_smoothing,
+                             reduction="none")
         p_t = torch.exp(-ce)
         return ((1 - p_t) ** self.gamma * ce).mean()
 

@@ -52,6 +52,11 @@ batch_size:  32
 lr:          3.0e-4
 num_workers: 2
 
+mixup_p:         0.5     # 배치당 mixup 적용 확률
+mixup_alpha:     0.4     # Beta(α,α) — 0.4는 BirdCLEF 검증값
+label_smoothing: 0.1     # FocalLoss 내 soft target 비율
+tta_n:           3       # 추론 TTA 패스 수 (1=off, 3=±15프레임)
+
 # 스펙트로그램 캐시 (첫 실행에서 변환 후 .npy로 저장 → 이후 librosa 호출 없음)
 cache_spectrograms: true
 cache_dir: "data/spec_cache"

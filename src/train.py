@@ -43,9 +43,20 @@ def spec_augment(spec, T: int = 40, F: int = 20, num_T: int = 2, num_F: int = 2)
     return spec
 
 
+def mixup_data(spec, ais, alpha=0.4):
+    """배치 내 두 샘플을 λ:(1-λ)로 보간. λ-트릭으로 정수 라벨 FocalLoss와 호환."""
+    import torch
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(spec.size(0), device=spec.device)
+    mixed_spec = lam * spec + (1 - lam) * spec[idx]
+    mixed_ais  = lam * ais  + (1 - lam) * ais[idx]
+    return mixed_spec, mixed_ais, idx, lam
+
+
 # ── 공통 루프 헬퍼 ────────────────────────────────────────────────────────────
 
-def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=True, desc="train"):
+def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=True, desc="train",
+                 mixup_p=0.0, mixup_alpha=0.4):
     import torch
     model.train()
     total_loss = 0.0
@@ -54,9 +65,17 @@ def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=Tr
         spec, ais, label = spec.to(device), ais.to(device), label.to(device)
         if augment:
             spec = spec_augment(spec)
+        use_mix = augment and mixup_p > 0 and float(np.random.rand()) < mixup_p
+        mix_idx, lam = None, 1.0
+        if use_mix:
+            spec, ais, mix_idx, lam = mixup_data(spec, ais, alpha=mixup_alpha)
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            loss = criterion(model(spec, ais), label)
+            out = model(spec, ais)
+            if use_mix:
+                loss = lam * criterion(out, label) + (1 - lam) * criterion(out, label[mix_idx])
+            else:
+                loss = criterion(out, label)
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -94,6 +113,30 @@ def _predict(model, loader, device, desc="predict"):
                 logits = model(spec, ais)
             preds.append(torch.softmax(logits, dim=1).cpu().numpy())
     return np.concatenate(preds)
+
+
+def _predict_tta(model, loader, device, n_tta: int = 3, desc="predict"):
+    """TTA: time-shift ±step 프레임 n_tta 패스 평균. n_tta=1이면 일반 predict."""
+    import torch
+    if n_tta <= 1:
+        return _predict(model, loader, device, desc)
+    step = 15  # 프레임 ≈ 0.24초 (hop_length=512, sr=32000)
+    half = n_tta // 2
+    shifts = [k * step for k in range(-half, half + 1)][:n_tta]
+    model.eval()
+    all_preds = []
+    for shift in shifts:
+        preds = []
+        with torch.no_grad():
+            for batch in tqdm(loader, desc=f"{desc}[s={shift:+d}]", leave=False, dynamic_ncols=True):
+                spec, ais = batch[0].to(device), batch[1].to(device)
+                if shift:
+                    spec = torch.roll(spec, shift, dims=-1)
+                with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                    logits = model(spec, ais)
+                preds.append(torch.softmax(logits, dim=1).cpu().numpy())
+        all_preds.append(np.concatenate(preds))
+    return np.mean(all_preds, axis=0)
 
 
 def _make_loader(df, audio_dir, cfg, demo, is_test=False,
@@ -141,7 +184,8 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         cnts = np.bincount(labels[tr_idx], minlength=n_cls).astype(float)
         w    = torch.tensor((cnts.sum() / (n_cls * cnts)).clip(0.1, 10),
                             dtype=torch.float32, device=device)
-        criterion = FocalLoss(gamma=2.0, weight=w)
+        criterion = FocalLoss(gamma=2.0, weight=w,
+                              label_smoothing=cfg.get("label_smoothing", 0.0))
 
         model = create_audio_model(cfg, n_cls).to(device)
 
@@ -157,6 +201,8 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
                          unit="ep", dynamic_ncols=True)
         for epoch in epoch_bar:
             loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device,
+                                mixup_p=cfg.get("mixup_p", 0.0),
+                                mixup_alpha=cfg.get("mixup_alpha", 0.4),
                                 desc="  train")
             va_preds, va_labels = _eval_epoch(model, va_loader, device, desc="  val")
             score = get_metric("multiclass", va_labels, va_preds)
@@ -197,15 +243,16 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
     loaded = 0
 
     model = create_audio_model(cfg, n_cls).to(device)
+    tta_n = cfg.get("tta_n", 1)
     for fold in tqdm(range(n_folds), desc="앙상블 예측", unit="fold", dynamic_ncols=True):
         ckpt = os.path.join(exp_dir, f"model_fold{fold}.pt")
         if not os.path.exists(ckpt):
             continue
         model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
-        val_preds  += _predict(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
-                               device, desc=f"  fold{fold} val")
-        test_preds += _predict(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
-                               device, desc=f"  fold{fold} test")
+        val_preds  += _predict_tta(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
+                                   device, n_tta=tta_n, desc=f"  fold{fold} val")
+        test_preds += _predict_tta(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
+                                   device, n_tta=tta_n, desc=f"  fold{fold} test")
         loaded += 1
 
     if loaded:
