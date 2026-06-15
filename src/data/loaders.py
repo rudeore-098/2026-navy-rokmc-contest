@@ -101,6 +101,7 @@ class AudioDataset(_TorchDataset):
         self.hop_length = cfg.get("hop_length",  512)
         self.f_min      = cfg.get("f_min",       50)
         self.f_max      = cfg.get("f_max",       16000)
+        self.use_cqt    = cfg.get("use_cqt",     False)
 
         # SOG log-clip 정규화 통계 (df에서 계산)
         if "sog" in df.columns:
@@ -155,31 +156,47 @@ class AudioDataset(_TorchDataset):
             cog_missing, hdg_missing,
         ], dtype=np.float32)
 
-    def _load_spec(self, filename):
-        if self.demo:
-            time_frames = int(self.sr * self.duration) // self.hop_length + 1
-            return np.random.rand(self.n_mels, time_frames).astype(np.float32)
-
-        # packed 배열 우선 (파일 오픈 없이 슬라이스)
+    def _load_mel(self, filename):
         if self._packed is not None and filename in self._packed_index:
             return np.array(self._packed[self._packed_index[filename]])
-
-        # fallback: 개별 .npy
         npy_path = os.path.join(self.cache_dir, filename.replace(".wav", ".npy"))
         try:
             return np.load(npy_path)
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"캐시 파일이 없습니다: {npy_path}\n"
-                "학습 전 mel 변환을 먼저 실행하세요:\n"
                 "  python -m src.data.mel --config configs/audio_task1.yaml"
             ) from None
+
+    def _load_spec(self, filename):
+        """스펙트로그램 로드. 반환 shape: (C, n_mels, T) — C=1(mel) or C=2(mel+cqt)."""
+        time_frames = int(self.sr * self.duration) // self.hop_length + 1
+
+        if self.demo:
+            C = 2 if self.use_cqt else 1
+            return np.random.rand(C, self.n_mels, time_frames).astype(np.float32)
+
+        mel = self._load_mel(filename)   # (n_mels, T)
+
+        if not self.use_cqt:
+            return mel[np.newaxis]       # (1, n_mels, T)
+
+        cqt_path = os.path.join(self.cache_dir, filename.replace(".wav", "_cqt.npy"))
+        try:
+            cqt = np.load(cqt_path)     # (n_bins, T)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                f"CQT 캐시 없음: {cqt_path}\n"
+                "  python -m src.data.mel --config configs/audio_task1.yaml"
+            ) from None
+
+        return np.stack([mel, cqt], axis=0)  # (2, n_mels, T)
 
     def __getitem__(self, idx):
         import torch
         row = self.df.iloc[idx]
 
-        spec_tensor = torch.from_numpy(self._load_spec(row["filename"])).unsqueeze(0)
+        spec_tensor = torch.from_numpy(self._load_spec(row["filename"]))  # (C, n_mels, T)
         ais_tensor  = torch.from_numpy(self._encode_ais(row))
 
         if self.is_test:
