@@ -48,7 +48,7 @@ ais_dim: 5
 epochs:      20
 batch_size:  32
 lr:          1.0e-3
-num_workers: 4
+num_workers: 2
 
 # 스펙트로그램 캐시 (첫 실행에서 변환 후 .npy로 저장 → 이후 librosa 호출 없음)
 cache_spectrograms: true
