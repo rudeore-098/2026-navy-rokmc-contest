@@ -8,6 +8,9 @@
 [변경 사항 - 2026-06-15]
 - tabular / vision 분기 제거 (음향 대회 전용)
 - audio 학습 로직만 유지
+- StratifiedGroupKFold 지원 (cv_type 키)
+- DataLoader persistent_workers / prefetch_factor 보강
+- fold 단위 중간 저장 (Ctrl+C 안전망)
 """
 import os
 import argparse
@@ -32,10 +35,11 @@ def load_config(path):
 def train_audio(cfg, exp_dir, logger):
     """AST audio + AIS 융합 학습 → OOF/test 예측 저장.
 
-    - ship_id GroupKFold (배 누수 차단)
+    - ship_id StratifiedGroupKFold (배 누수 차단 + 클래스 균등)
     - effective number weighted CrossEntropy (Macro F1 / 소수클래스 대응)
     - AST fbank npy 우선 로드(scripts/precompute_ast.py), 없으면 WAV fallback
     - fold 내 best Macro F1 에폭의 가중치를 복원해 OOF·test 예측을 동일 체크포인트로 통일
+    - fold 단위로 submission.csv 중간 저장 (Ctrl+C 시 마지막 fold까지의 결과 보존)
     """
     import torch
     import torch.nn as nn
@@ -75,6 +79,17 @@ def train_audio(cfg, exp_dir, logger):
             logger.info(f"[audio] val 입력 없음({vprobe}) → 홀드아웃 평가 생략")
             has_val = False
 
+    def predict(model, loader):
+        """(mel, ais[, y]) 배치를 받아 softmax 확률 (N, C) 반환."""
+        model.eval()
+        out = []
+        with torch.no_grad():
+            for batch in loader:
+                mel, ais = batch[0], batch[1]
+                with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
+                    out.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
+        return np.concatenate(out)
+
     # === CV splitter 선택 (config의 cv_type 키로 분기) ===
     cv_type = cfg.get("cv_type", "stratified_group")
     if cv_type == "stratified_group":
@@ -111,11 +126,13 @@ def train_audio(cfg, exp_dir, logger):
         tl = DataLoader(make_dataset(train.iloc[tri], tr_ais[tri], cfg_tr, y[tri], train=True),
                         batch_size=cfg["batch_size"], shuffle=True,
                         num_workers=nw, pin_memory=True, drop_last=True,
-                        persistent_workers=(nw > 0), prefetch_factor=2)
+                        persistent_workers=(nw > 0),
+                        prefetch_factor=2 if nw > 0 else None)
         vl = DataLoader(make_dataset(train.iloc[vai], tr_ais[vai], cfg_tr, y[vai], train=False),
-                        batch_size=cfg["batch_size"], shuffle=False, num_workers=nw,
-                        pin_memory=True,
-                        persistent_workers=(nw > 0), prefetch_factor=2)
+                        batch_size=cfg["batch_size"], shuffle=False,
+                        num_workers=nw, pin_memory=True,
+                        persistent_workers=(nw > 0),
+                        prefetch_factor=2 if nw > 0 else None)
 
         model = create_audio_model(cfg["model_name"], n_class, cfg.get("pretrained", True)).to(dev)
         # class_weights: effective number (β=0.9999 기본, config에서 override 가능)
@@ -150,15 +167,44 @@ def train_audio(cfg, exp_dir, logger):
         if best_state is not None:
             model.load_state_dict(best_state)
         tel = DataLoader(make_dataset(test, te_ais, cfg_te, None, train=False),
-                         batch_size=cfg["batch_size"], shuffle=False, num_workers=nw,
-                         pin_memory=True, prefetch_factor=2)
+                         batch_size=cfg["batch_size"], shuffle=False,
+                         num_workers=nw, pin_memory=True,
+                         prefetch_factor=2 if nw > 0 else None)
         test_pred += predict(model, tel) / cfg["n_folds"]
         if has_val:
             vel = DataLoader(make_dataset(val, va_ais, cfg_te, None, train=False),
-                             batch_size=cfg["batch_size"], shuffle=False, num_workers=nw)
+                             batch_size=cfg["batch_size"], shuffle=False,
+                             num_workers=nw, pin_memory=True,
+                             prefetch_factor=2 if nw > 0 else None)
             val_pred += predict(model, vel) / cfg["n_folds"]
         torch.save(model.state_dict(), os.path.join(exp_dir, f"audio_fold{fold}.pt"))
 
+        # === fold 단위 중간 저장 (Ctrl+C 안전망) ===
+        n_done = fold + 1
+        partial_test = test_pred * (cfg["n_folds"] / n_done)   # 누적합 → 평균 복원
+        np.save(os.path.join(exp_dir, "oof.npy"), oof)
+        np.save(os.path.join(exp_dir, "oof_audio.npy"), oof)
+        np.save(os.path.join(exp_dir, "test_audio.npy"), partial_test)
+        np.save(os.path.join(exp_dir, "y_true.npy"), y)
+        if has_val:
+            partial_val = val_pred * (cfg["n_folds"] / n_done)
+            np.save(os.path.join(exp_dir, "val_audio.npy"), partial_val)
+
+        # 누적 평균 기반 submission
+        sub = pd.DataFrame({
+            "filename": test["filename"].values,
+            "predicted_class": [IDX_TO_SHIP_TYPE[i] for i in partial_test.argmax(axis=1)],
+        })
+        sub.to_csv(os.path.join(exp_dir, "submission_task1.csv"), index=False)
+
+        # 진행 상황 로그 — 지금까지 완료한 fold의 val만 모아서 partial OOF 계산
+        done_idx = np.concatenate([v for _, v in splits[:n_done]])
+        partial_oof_score = get_metric(task, y[done_idx], oof[done_idx])
+        logger.info(f"[checkpoint] fold {n_done}/{cfg['n_folds']} 완료 | "
+                    f"partial OOF {metric_name(task)}={partial_oof_score:.5f} | "
+                    f"submission 저장 ({len(sub)}행)")
+
+    # === 5 fold 완주 시 최종 정리 (중간 저장본을 덮어쓰기) ===
     score = get_metric(task, y, oof)
     logger.info(f"[audio] OOF {metric_name(task)}: {score:.5f}")
     if has_val:
@@ -171,8 +217,7 @@ def train_audio(cfg, exp_dir, logger):
     np.save(os.path.join(exp_dir, "test_audio.npy"), test_pred)
     np.save(os.path.join(exp_dir, "y_true.npy"), y)
 
-    # 제출 파일 (filename, predicted_class) — 5-fold 평균 확률의 argmax → 라벨 문자열
-    target_col = cfg.get("target_col", "ship_type")
+    # 제출 파일 (filename, predicted_class) — n-fold 평균 확률의 argmax → 라벨 문자열
     sub = pd.DataFrame({
         "filename": test["filename"].values,
         "predicted_class": [IDX_TO_SHIP_TYPE[i] for i in test_pred.argmax(axis=1)],
@@ -214,7 +259,7 @@ def main():
                 "class_weight_beta": cfg.get("class_weight_beta", 0.9999),
                 "n_folds": cfg["n_folds"]},
         oof_score=results["audio"], cv=f"{cfg['n_folds']}fold",
-        seed=cfg["seed"], notes=f"AIS 14-d + effective_num_weight",
+        seed=cfg["seed"], notes=f"AIS 14-d + effective_num_weight + StratifiedGroupKFold",
     )
     logger.info(f"완료. 산출물: {exp_dir}/ (oof.npy, test_*.npy, val_audio.npy, submission_task1.csv)")
 
