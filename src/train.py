@@ -201,7 +201,7 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         ckpt = os.path.join(exp_dir, f"model_fold{fold}.pt")
         if not os.path.exists(ckpt):
             continue
-        model.load_state_dict(torch.load(ckpt, map_location=device))
+        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
         val_preds  += _predict(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
                                device, desc=f"  fold{fold} val")
         test_preds += _predict(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
