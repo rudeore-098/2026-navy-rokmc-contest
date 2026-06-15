@@ -436,13 +436,60 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
     return {"oof_macro_f1": oof_score, "val_macro_f1": val_score}
 
 
+# ── 체크포인트 → npy 생성 (학습 중단 후 예측만 뽑을 때) ──────────────────────
+
+def predict_only(cfg, exp_dir, demo, logger):
+    """experiments/{exp}/model_fold*.pt 로 val_pred.npy, test_pred.npy 생성."""
+    import torch
+    import glob
+    from src.models.audio import create_audio_model
+    from src.data.loaders import load_task1, SHIP_TYPE_TO_IDX
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_cls  = len(SHIP_TYPE_TO_IDX)
+    tta_n  = cfg.get("tta_n", 1)
+
+    ckpts = sorted(glob.glob(os.path.join(exp_dir, "model_fold*.pt")))
+    if not ckpts:
+        logger.error(f"체크포인트 없음: {exp_dir}/model_fold*.pt")
+        return
+
+    logger.info(f"발견된 체크포인트 {len(ckpts)}개: {[os.path.basename(c) for c in ckpts]}")
+
+    val_df,  val_audio  = load_task1(cfg, "val",  demo=demo)
+    test_df, test_audio = load_task1(cfg, "test", demo=demo)
+    val_preds  = np.zeros((len(val_df),  n_cls), dtype=np.float32)
+    test_preds = np.zeros((len(test_df), n_cls), dtype=np.float32)
+
+    model = create_audio_model(cfg, n_cls).to(device)
+    for ckpt in tqdm(ckpts, desc="predict", unit="fold", dynamic_ncols=True):
+        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        val_preds  += _predict_tta(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
+                                   device, n_tta=tta_n, desc=f"  {os.path.basename(ckpt)} val")
+        test_preds += _predict_tta(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
+                                   device, n_tta=tta_n, desc=f"  {os.path.basename(ckpt)} test")
+
+    val_preds  /= len(ckpts)
+    test_preds /= len(ckpts)
+
+    np.save(os.path.join(exp_dir, "val_pred.npy"),  val_preds)
+    np.save(os.path.join(exp_dir, "test_pred.npy"), test_preds)
+
+    val_score = get_metric("multiclass",
+                           val_df["ship_type"].map(SHIP_TYPE_TO_IDX).values, val_preds)
+    logger.info(f"val MacroF1: {val_score:.5f}  ({len(ckpts)} ckpt 평균)")
+    logger.info(f"저장: {exp_dir}/val_pred.npy, test_pred.npy")
+
+
 # ── 엔트리포인트 ───────────────────────────────────────────────────────────────
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
-    ap.add_argument("--exp",    default="exp_001")
-    ap.add_argument("--demo",   action="store_true")
+    ap.add_argument("--config",       required=True)
+    ap.add_argument("--exp",          default="exp_001")
+    ap.add_argument("--demo",         action="store_true")
+    ap.add_argument("--predict-only", action="store_true",
+                    help="학습 없이 기존 체크포인트로 val_pred/test_pred.npy만 생성")
     args = ap.parse_args()
 
     cfg    = load_config(args.config)
@@ -451,6 +498,11 @@ def main():
 
     exp_dir = os.path.join("experiments", args.exp)
     os.makedirs(exp_dir, exist_ok=True)
+
+    if args.predict_only:
+        logger.info(f"=== predict-only | exp={args.exp} ===")
+        predict_only(cfg, exp_dir, args.demo, logger)
+        return
 
     task     = cfg.get("task", "multiclass")
     task_type = cfg.get("type", "audio")
