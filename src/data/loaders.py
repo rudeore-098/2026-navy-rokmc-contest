@@ -249,11 +249,14 @@ class AudioDataset(_TorchDataset):
     # cog/heading은 원형 → sin/cos 2차원으로 펼쳐 총 5-dim
     _SOG_MEAN, _SOG_STD = 10.0, 8.0
 
-    def __init__(self, df, audio_dir, cfg, is_test=False, demo=False):
+    def __init__(self, df, audio_dir, cfg, is_test=False, demo=False,
+                 label_col=None, label_map=None):
         self.df        = df.reset_index(drop=True)
         self.audio_dir = audio_dir
         self.is_test   = is_test
         self.demo      = demo
+        self.label_col = label_col or "ship_type"
+        self.label_map = label_map if label_map is not None else SHIP_TYPE_TO_IDX
 
         self.sr         = cfg.get("sample_rate", 32000)
         self.duration   = cfg.get("duration",    5.0)
@@ -305,5 +308,5 @@ class AudioDataset(_TorchDataset):
         if self.is_test:
             return spec_tensor, ais_tensor
 
-        label = SHIP_TYPE_TO_IDX[row["ship_type"]]
+        label = self.label_map[row[self.label_col]]
         return spec_tensor, ais_tensor, torch.tensor(label, dtype=torch.long)
