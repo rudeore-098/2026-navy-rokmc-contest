@@ -37,7 +37,7 @@ f_min:       50
 f_max:       16000
 
 # ── 모델 ──────────────────────────────────────────────────────────────────────
-model_name: "eca_nfnet_l0"   # 음향 대회 단골. 앙상블 시 tf_efficientnet_b2_ns 등으로 교체
+model_name: "tf_efficientnet_b2_ns"
 in_chans:   1
 pretrained: true
 

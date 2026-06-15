@@ -1,0 +1,47 @@
+# Task 1 — AST (Audio Spectrogram Transformer) 실험
+# 사용: python -m src.train --config configs/audio_task1_ast.yaml --exp exp_t1_ast_001
+#
+# 앙상블: python -m src.ensemble --task multiclass --exps exp_t1_001 exp_t1_ast_001
+
+type: audio
+task: multiclass
+
+seed: 42
+n_folds: 5
+group_col: ship_id
+
+# ── 경로 (task1과 동일) ────────────────────────────────────────────────────────
+paths:
+  train:       "data/train/train.csv"
+  train_audio: "data/train/audio"
+
+  task1_val:   "data/task1_test/val.csv"
+  task1_test:  "data/task1_test/test.csv"
+  task1_audio: "data/task1_test/audio"
+
+  ship_list:   "data/ship_list.csv"
+  sample_sub:  "data/sample_submission_task1.csv"
+
+target_col: "ship_type"
+
+# ── 음향 파라미터 (task1과 동일) ───────────────────────────────────────────────
+sample_rate: 32000
+duration:    5.0
+n_mels:      128
+n_fft:       2048
+hop_length:  512
+f_min:       50
+f_max:       16000
+
+# ── 모델 ──────────────────────────────────────────────────────────────────────
+model_name:    "ast"
+ast_pretrained: "MIT/ast-finetuned-audioset-10-10-0.4593"  # AudioSet 사전학습
+ais_dim:       5
+embed_dim:     512
+
+# ── 학습 (Transformer → CNN보다 낮은 lr) ──────────────────────────────────────
+epochs:      20
+batch_size:  16    # Transformer는 메모리 더 사용
+lr:          5.0e-5
+num_workers: 4
+patience:    5

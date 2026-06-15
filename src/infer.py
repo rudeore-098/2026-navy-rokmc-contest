@@ -1,17 +1,16 @@
-"""추론 — 저장된 test 예측을 모아 제출 파일 생성.
-
-train.py가 각 모델의 test_{kind}.npy를 저장해뒀으므로,
-여기선 그것들을 합쳐(단순 평균 또는 ensemble.py의 가중치) submission.csv를 만든다.
+"""Task 1 제출 파일 생성 — train.py가 저장한 test_pred.npy → submission.csv.
 
 사용법:
-    python -m src.infer --config configs/tabular.yaml --exp exp_001
+    python -m src.infer --config configs/audio_task1.yaml --exp exp_t1_001
+    python -m src.infer --config configs/audio_task1.yaml --exp exp_t1_001 --split val
 """
 import os
 import argparse
 import numpy as np
 import pandas as pd
 
-from src.utils.metrics import to_submission
+from src.data.loaders import IDX_TO_SHIP_TYPE, SHIP_TYPE_TO_IDX
+from src.utils.metrics import get_metric
 
 
 def load_config(path):
@@ -23,40 +22,35 @@ def load_config(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--exp", default="exp_001")
-    ap.add_argument("--weights", default=None,
-                    help="콤마구분 가중치 'lgb,xgb,cat' 예: 0.5,0.2,0.3 (없으면 단순평균)")
+    ap.add_argument("--exp",    default="exp_001")
+    ap.add_argument("--split",  default="test", choices=["test", "val"])
     args = ap.parse_args()
 
-    cfg = load_config(args.config)
+    cfg     = load_config(args.config)
     exp_dir = os.path.join("experiments", args.exp)
-    task = cfg["task"]
+    paths   = cfg["paths"]
 
-    kinds = ["lgb", "xgb", "cat"]
-    test_preds, used = [], []
-    for k in kinds:
-        p = os.path.join(exp_dir, f"test_{k}.npy")
-        if os.path.exists(p):
-            test_preds.append(np.load(p)); used.append(k)
-    if not test_preds:
-        raise FileNotFoundError(f"{exp_dir}에 test_*.npy가 없습니다. 먼저 train을 실행하세요.")
+    preds = np.load(os.path.join(exp_dir, f"{args.split}_pred.npy"))  # (N, 4)
 
-    if args.weights:
-        w = np.array([float(x) for x in args.weights.split(",")])
-        w = w / w.sum()
-        final = sum(wi * p for wi, p in zip(w, test_preds))
+    if args.split == "test":
+        df = pd.read_csv(paths["task1_test"])
     else:
-        final = np.mean(test_preds, axis=0)
+        df = pd.read_csv(paths["task1_val"])
 
-    test_ids = np.load(os.path.join(exp_dir, "test_ids.npy"))
     sub = pd.DataFrame({
-        cfg.get("id_col", "id"): test_ids,
-        cfg.get("target_col", "target"): to_submission(task, final),
+        "filename":  df["filename"],
+        "ship_type": [IDX_TO_SHIP_TYPE[i] for i in preds.argmax(axis=1)],
     })
-    out = os.path.join(exp_dir, "submission.csv")
+
+    out = os.path.join(exp_dir, f"submission_{args.split}.csv")
     sub.to_csv(out, index=False)
-    print(f"제출 파일 저장: {out} (모델: {used})")
-    print(sub.head())
+    print(f"Saved: {out}  ({len(sub)} rows)")
+    print(sub["ship_type"].value_counts().to_string())
+
+    if args.split == "val":
+        true = df["ship_type"].map(SHIP_TYPE_TO_IDX).values
+        score = get_metric("multiclass", true, preds)
+        print(f"\nVal MacroF1: {score:.5f}")
 
 
 if __name__ == "__main__":
