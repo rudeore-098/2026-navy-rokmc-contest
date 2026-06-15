@@ -1,0 +1,51 @@
+# Task 1 — 선종 분류 (4-class Macro F1)
+# 사용: python -m src.train --config configs/audio_task1.yaml --exp exp_t1_001
+#
+# 데이터 준비 (한 번만):
+#   data/ 아래에 대회 폴더를 복사 또는 심볼릭링크
+#   mklink /D "data\train"      "C:\...\competition_final\train"
+#   mklink /D "data\task1_test" "C:\...\competition_final\task1_test"
+
+type: audio
+task: multiclass        # Macro F1
+
+seed: 42
+n_folds: 5
+group_col: ship_id      # 같은 배 클립이 train/val에 섞이지 않도록 GroupKFold
+
+# ── 경로 ──────────────────────────────────────────────────────────────────────
+paths:
+  train:       "data/train/train.csv"
+  train_audio: "data/train/audio"
+
+  task1_val:   "data/task1_test/val.csv"
+  task1_test:  "data/task1_test/test.csv"
+  task1_audio: "data/task1_test/audio"
+
+  ship_list:   "data/ship_list.csv"
+  sample_sub:  "data/sample_submission_task1.csv"
+
+target_col: "ship_type"
+
+# ── 음향 파라미터 ──────────────────────────────────────────────────────────────
+sample_rate: 32000
+duration:    5.0
+n_mels:      128
+n_fft:       2048
+hop_length:  512
+f_min:       50
+f_max:       16000
+
+# ── 모델 ──────────────────────────────────────────────────────────────────────
+model_name: "eca_nfnet_l0"   # 음향 대회 단골. 앙상블 시 tf_efficientnet_b2_ns 등으로 교체
+in_chans:   1
+pretrained: true
+
+# AIS 피처 차원: sog(1) + sin/cos×cog(2) + sin/cos×heading(2) = 5
+ais_dim: 5
+
+# ── 학습 ──────────────────────────────────────────────────────────────────────
+epochs:      20
+batch_size:  32
+lr:          1.0e-3
+num_workers: 4
