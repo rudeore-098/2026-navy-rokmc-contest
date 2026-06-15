@@ -103,18 +103,17 @@ def train_audio(cfg, exp_dir, logger):
         logger.info(f"[cv] fold{fi} val_dist={val_dist.tolist()} "
                     f"groups(train={len(train_groups)}, val={len(val_groups)}, leak={leak})")
 
-oof = np.zeros((len(train), n_class))
-test_pred = np.zeros((len(test), n_class))
-val_pred = np.zeros((len(val), n_class)) if has_val else None
+    oof = np.zeros((len(train), n_class))
+    test_pred = np.zeros((len(test), n_class))
+    val_pred = np.zeros((len(val), n_class)) if has_val else None
 
-for fold, (tri, vai) in enumerate(splits):     # ← cv_split(...) 대신 splits 직접 순회
-    tl = DataLoader(...)
+    for fold, (tri, vai) in enumerate(splits):
         tl = DataLoader(make_dataset(train.iloc[tri], tr_ais[tri], cfg_tr, y[tri], train=True),
                         batch_size=cfg["batch_size"], shuffle=True,
-                        num_workers=nw, pin_memory=True, drop_last=True
+                        num_workers=nw, pin_memory=True, drop_last=True,
                         persistent_workers=(nw > 0), prefetch_factor=2)
         vl = DataLoader(make_dataset(train.iloc[vai], tr_ais[vai], cfg_tr, y[vai], train=False),
-                        batch_size=cfg["batch_size"], shuffle=False, num_workers=nw
+                        batch_size=cfg["batch_size"], shuffle=False, num_workers=nw,
                         pin_memory=True,
                         persistent_workers=(nw > 0), prefetch_factor=2)
 
