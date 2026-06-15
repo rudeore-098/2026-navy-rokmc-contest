@@ -36,7 +36,7 @@ f_max:       16000
 # ── 모델 ──────────────────────────────────────────────────────────────────────
 model_name:    "ast"
 ast_pretrained: "MIT/ast-finetuned-audioset-10-10-0.4593"  # AudioSet 사전학습
-ais_dim:       5
+ais_dim:       7
 embed_dim:     512
 
 # ── 학습 (Transformer → CNN보다 낮은 lr) ──────────────────────────────────────

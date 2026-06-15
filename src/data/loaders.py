@@ -83,7 +83,6 @@ class AudioDataset(_TorchDataset):
     cache_dir : 미리 변환된 .npy 폴더 (None이면 매번 librosa 호출)
     """
 
-    _SOG_MEAN, _SOG_STD = 10.0, 8.0
 
     def __init__(self, df, audio_dir, cfg, is_test=False, demo=False,
                  label_col=None, label_map=None, cache_dir="data/spec_cache"):
@@ -103,6 +102,14 @@ class AudioDataset(_TorchDataset):
         self.f_min      = cfg.get("f_min",       50)
         self.f_max      = cfg.get("f_max",       16000)
 
+        # SOG log-clip 정규화 통계 (df에서 계산)
+        if "sog" in df.columns:
+            sog_log = np.log1p(np.clip(df["sog"].astype(float).values, 0, 30))
+            self._sog_log_mean = float(sog_log.mean())
+            self._sog_log_std  = float(sog_log.std() + 1e-6)
+        else:
+            self._sog_log_mean, self._sog_log_std = 0.348, 0.781
+
         # packed 배열 로드 (있으면 파일 오픈 오버헤드 제거)
         self._packed = None
         self._packed_index = None
@@ -118,14 +125,34 @@ class AudioDataset(_TorchDataset):
         return len(self.df)
 
     def _encode_ais(self, row):
-        """AIS 메타데이터 → 5-dim float32 벡터 (sog + sin/cos×cog + sin/cos×heading)."""
-        sog = (float(row.get("sog", 0.0)) - self._SOG_MEAN) / (self._SOG_STD + 1e-6)
-        cog_rad = np.deg2rad(float(row.get("cog", 0.0)))
-        hdg_rad = np.deg2rad(float(row.get("true_heading", 0.0)))
+        """AIS 메타데이터 → 7-dim float32 벡터 (Model B 방식).
+
+        센티넬 처리:
+          SOG==0 or COG==360 → cog sin/cos 마스킹 + cog_missing=1
+          HDG==0 or HDG>360  → hdg sin/cos 마스킹 + hdg_missing=1
+
+        [sog_norm, cog_sin, cog_cos, hdg_sin, hdg_cos, cog_missing, hdg_missing]
+        """
+        sog_raw = float(row.get("sog", 0.0))
+        cog_raw = float(row.get("cog", 0.0))
+        hdg_raw = float(row.get("true_heading", 0.0))
+
+        sog_log  = np.log1p(np.clip(sog_raw, 0, 30))
+        sog_norm = (sog_log - self._sog_log_mean) / self._sog_log_std
+
+        cog_missing = float(cog_raw == 360.0 or sog_raw == 0.0)
+        hdg_missing = float(hdg_raw == 0.0 or hdg_raw > 360.0)
+
+        cog_rad = np.deg2rad(cog_raw)
+        hdg_rad = np.deg2rad(hdg_raw)
+        cog_sin = 0.0 if cog_missing else float(np.sin(cog_rad))
+        cog_cos = 0.0 if cog_missing else float(np.cos(cog_rad))
+        hdg_sin = 0.0 if hdg_missing else float(np.sin(hdg_rad))
+        hdg_cos = 0.0 if hdg_missing else float(np.cos(hdg_rad))
+
         return np.array([
-            sog,
-            np.sin(cog_rad), np.cos(cog_rad),
-            np.sin(hdg_rad), np.cos(hdg_rad),
+            sog_norm, cog_sin, cog_cos, hdg_sin, hdg_cos,
+            cog_missing, hdg_missing,
         ], dtype=np.float32)
 
     def _load_spec(self, filename):

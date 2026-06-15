@@ -1,0 +1,32 @@
+# LightGBM AIS-only — Task 1 선종 분류 (7-dim AIS 피처)
+# 사용: python -m src.train_lgbm --config configs/lgbm_ais.yaml --exp exp_lgbm_ais_001
+
+type: lgbm
+task: multiclass
+
+seed: 42
+n_folds: 5
+group_col: ship_id
+
+paths:
+  train:      "data/train/train.csv"
+  task1_val:  "data/task1_test/val.csv"
+  task1_test: "data/task1_test/test.csv"
+
+target_col: "ship_type"
+
+early_stopping_rounds: 50
+
+lgbm:
+  objective:        multiclass
+  num_class:        4
+  n_estimators:     2000
+  learning_rate:    0.05
+  num_leaves:       31
+  min_child_samples: 20
+  colsample_bytree: 0.9
+  subsample:        0.8
+  subsample_freq:   5
+  class_weight:     balanced
+  n_jobs:           -1
+  verbose:          -1
