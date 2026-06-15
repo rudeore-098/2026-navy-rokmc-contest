@@ -103,6 +103,17 @@ class AudioDataset(_TorchDataset):
         self.f_min      = cfg.get("f_min",       50)
         self.f_max      = cfg.get("f_max",       16000)
 
+        # packed 배열 로드 (있으면 파일 오픈 오버헤드 제거)
+        self._packed = None
+        self._packed_index = None
+        if not demo:
+            packed_path = os.path.join(cache_dir, "packed_all.npy")
+            index_path  = os.path.join(cache_dir, "packed_all_index.json")
+            if os.path.exists(packed_path) and os.path.exists(index_path):
+                import json
+                self._packed = np.load(packed_path, mmap_mode='r')
+                self._packed_index = json.load(open(index_path))
+
     def __len__(self):
         return len(self.df)
 
@@ -118,11 +129,15 @@ class AudioDataset(_TorchDataset):
         ], dtype=np.float32)
 
     def _load_spec(self, filename):
-        time_frames = int(self.sr * self.duration) // self.hop_length + 1
-
         if self.demo:
+            time_frames = int(self.sr * self.duration) // self.hop_length + 1
             return np.random.rand(self.n_mels, time_frames).astype(np.float32)
 
+        # packed 배열 우선 (파일 오픈 없이 슬라이스)
+        if self._packed is not None and filename in self._packed_index:
+            return np.array(self._packed[self._packed_index[filename]])
+
+        # fallback: 개별 .npy
         npy_path = os.path.join(self.cache_dir, filename.replace(".wav", ".npy"))
         try:
             return np.load(npy_path)
