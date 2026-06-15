@@ -38,10 +38,9 @@ f_max:       16000
 
 # ── 모델 ──────────────────────────────────────────────────────────────────────
 model_name: "tf_efficientnet_b2_ns"
-in_chans:   2       # 채널 1: mel, 채널 2: CQT
+in_chans:   1
 pretrained: true
-use_cqt:    true
-cqt_bins_per_octave: 16   # fmax ≈ 50 × 2^8 = 12800 Hz
+use_cqt:    false
 
 # AIS 피처 차원: sog(1) + sin/cos×cog(2) + sin/cos×hdg(2) + cog_missing(1) + hdg_missing(1) = 7
 ais_dim: 7
