@@ -110,7 +110,7 @@ def train_audio(cfg, exp_dir, demo, logger):
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader
-    from src.data.loaders import SHIP_TYPE_TO_IDX
+    from src.data.loaders import SHIP_TYPE_TO_IDX, IDX_TO_SHIP_TYPE
     from src.models.audio import (
         build_ais_features, make_dataset, create_audio_model, class_weights)
 
@@ -122,6 +122,7 @@ def train_audio(cfg, exp_dir, demo, logger):
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     cls2idx = SHIP_TYPE_TO_IDX
     n_class = len(cls2idx)
+    nw = cfg.get("num_workers", 4)
 
     train = pd.read_csv(cfg["paths"]["train"])
     test  = pd.read_csv(cfg["paths"]["task1_test"])
@@ -129,20 +130,56 @@ def train_audio(cfg, exp_dir, demo, logger):
     groups = train[cfg["group_col"]].values
     tr_ais, te_ais = build_ais_features(train), build_ais_features(test)
 
-    folder = get_folder(task, cfg["n_folds"], cfg["seed"], group=True)
-
-    oof = np.zeros((len(train), n_class))
-    test_pred = np.zeros((len(test), n_class))
     cfg_tr = {**cfg, "_audio_dir": cfg["paths"]["train_audio"]}
     cfg_te = {**cfg, "_audio_dir": cfg["paths"]["task1_audio"]}
+
+    # use_npy=true 인데 사전생성이 안 됐으면, 워커가 죽는 대신 여기서 명확히 안내
+    if cfg.get("use_npy", False):
+        md = cfg.get("mel_dir", "data/mel_npy")
+        probe = os.path.join(md, str(train["filename"].iloc[0]).replace(".wav", ".npy"))
+        if not os.path.exists(probe):
+            raise FileNotFoundError(
+                f"use_npy=true 인데 mel npy가 없습니다 ({probe}). "
+                f"먼저 `python scripts/precompute_mel.py --config <config> --fp16` 를 실행하세요. "
+                f"(또는 config에서 use_npy: false 로 바꾸면 WAV에서 즉석 변환)")
+
+    # 정답이 있는 홀드아웃(task1_val) — 있으면 OOF 와 별개로 실제 Macro F1 도 측정
+    val_path = cfg["paths"].get("task1_val")
+    has_val = bool(val_path) and os.path.exists(val_path)
+    if has_val:
+        val = pd.read_csv(val_path)
+        y_val = val[cfg["target_col"]].map(cls2idx).values
+        va_ais = build_ais_features(val)
+        # val 입력(npy/WAV)이 실제로 존재하는지 확인 → 없으면 홀드아웃만 생략
+        md = cfg.get("mel_dir", "data/mel_npy")
+        fn0 = str(val["filename"].iloc[0])
+        vprobe = (os.path.join(md, fn0.replace(".wav", ".npy")) if cfg.get("use_npy", False)
+                  else os.path.join(cfg["paths"]["task1_audio"], fn0))
+        if not os.path.exists(vprobe):
+            logger.info(f"[audio] val 입력 없음({vprobe}) → 홀드아웃 평가 생략")
+            has_val = False
+
+    def predict(model, loader):
+        """(mel, ais[, y]) 배치를 받아 softmax 확률 (N, C) 반환. 라벨 유무 무관."""
+        model.eval(); out = []
+        with torch.no_grad():
+            for batch in loader:
+                mel, ais = batch[0], batch[1]
+                with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
+                    out.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
+        return np.concatenate(out)
+
+    folder = get_folder(task, cfg["n_folds"], cfg["seed"], group=True)
+    oof = np.zeros((len(train), n_class))
+    test_pred = np.zeros((len(test), n_class))
+    val_pred = np.zeros((len(val), n_class)) if has_val else None
 
     for fold, (tri, vai) in enumerate(cv_split(folder, train, y, groups)):
         tl = DataLoader(make_dataset(train.iloc[tri], tr_ais[tri], cfg_tr, y[tri], train=True),
                         batch_size=cfg["batch_size"], shuffle=True,
-                        num_workers=cfg.get("num_workers", 4), pin_memory=True, drop_last=True)
+                        num_workers=nw, pin_memory=True, drop_last=True)
         vl = DataLoader(make_dataset(train.iloc[vai], tr_ais[vai], cfg_tr, y[vai], train=False),
-                        batch_size=cfg["batch_size"], shuffle=False,
-                        num_workers=cfg.get("num_workers", 4))
+                        batch_size=cfg["batch_size"], shuffle=False, num_workers=nw)
 
         model = create_audio_model(cfg["model_name"], n_class, cfg.get("pretrained", True)).to(dev)
         crit = nn.CrossEntropyLoss(weight=class_weights(y[tri], n_class).to(dev))
@@ -160,13 +197,7 @@ def train_audio(cfg, exp_dir, demo, logger):
                     loss = crit(model(mel, ais), yy)
                 scaler.scale(loss).backward(); scaler.step(opt); scaler.update()
             sched.step()
-            # fold val 예측
-            model.eval(); probs = []
-            with torch.no_grad():
-                for mel, ais, _ in vl:
-                    with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
-                        probs.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
-            probs = np.concatenate(probs)
+            probs = predict(model, vl)                      # fold val 예측
             f1 = get_metric(task, y[vai], probs)
             logger.info(f"[fold{fold}] ep{ep+1:02d} {metric_name(task)}={f1:.4f}")
             if f1 > best_f1:
@@ -174,26 +205,39 @@ def train_audio(cfg, exp_dir, demo, logger):
                 best_state = copy.deepcopy(model.state_dict())   # best 에폭 가중치 보관
         oof[vai] = best_oof
 
-        # OOF 와 동일한 best 체크포인트로 test 예측 (last 에폭 아님)
+        # OOF 와 동일한 best 체크포인트로 test/val 예측 (last 에폭 아님)
         if best_state is not None:
             model.load_state_dict(best_state)
         tel = DataLoader(make_dataset(test, te_ais, cfg_te, None, train=False),
-                         batch_size=cfg["batch_size"], shuffle=False,
-                         num_workers=cfg.get("num_workers", 4))
-        model.eval(); tp = []
-        with torch.no_grad():
-            for mel, ais in tel:
-                with torch.cuda.amp.autocast(enabled=(dev == "cuda")):
-                    tp.append(model(mel.to(dev), ais.to(dev)).float().softmax(1).cpu().numpy())
-        test_pred += np.concatenate(tp) / cfg["n_folds"]
+                         batch_size=cfg["batch_size"], shuffle=False, num_workers=nw)
+        test_pred += predict(model, tel) / cfg["n_folds"]
+        if has_val:
+            vel = DataLoader(make_dataset(val, va_ais, cfg_te, None, train=False),
+                             batch_size=cfg["batch_size"], shuffle=False, num_workers=nw)
+            val_pred += predict(model, vel) / cfg["n_folds"]
         torch.save(model.state_dict(), os.path.join(exp_dir, f"audio_fold{fold}.pt"))
 
     score = get_metric(task, y, oof)
     logger.info(f"[audio] OOF {metric_name(task)}: {score:.5f}")
+    if has_val:
+        val_score = get_metric(task, y_val, val_pred)
+        logger.info(f"[audio] VAL(holdout) {metric_name(task)}: {val_score:.5f}")
+        np.save(os.path.join(exp_dir, "val_audio.npy"), val_pred)
+
     np.save(os.path.join(exp_dir, "oof_audio.npy"), oof)
     np.save(os.path.join(exp_dir, "oof.npy"), oof)
     np.save(os.path.join(exp_dir, "test_audio.npy"), test_pred)
     np.save(os.path.join(exp_dir, "y_true.npy"), y)
+
+    # 제출 파일 (filename, ship_type) — 5-fold 평균 확률의 argmax → 라벨 문자열
+    target_col = cfg.get("target_col", "ship_type")
+    sub = pd.DataFrame({
+        "filename": test["filename"].values,
+        target_col: [IDX_TO_SHIP_TYPE[i] for i in test_pred.argmax(axis=1)],
+    })
+    sub_path = os.path.join(exp_dir, "submission_task1.csv")
+    sub.to_csv(sub_path, index=False)
+    logger.info(f"[audio] 제출 파일 저장: {sub_path} ({len(sub)}행) | 분포={sub[target_col].value_counts().to_dict()}")
     return {"audio": score}
 
 
