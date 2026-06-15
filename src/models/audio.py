@@ -1,25 +1,36 @@
-"""음향 모델 — log-mel(CNN 백본) + AIS(MLP) 융합 분류기.
+"""음향 모델 — AST(Audio Spectrogram Transformer) + AIS(MLP) 융합 분류기.
 
-vision.py 가 timm 백본 래퍼인 것과 같은 결로, 음향 전용 융합 모델을 제공한다.
-스펙트로그램을 1채널 이미지로 보고 timm CNN 에 넣되, AIS 정형 피처를 함께 융합한다.
+Task 1 전용. AST 백본만 사용. AudioSet pretrained.
 
 핵심 설계 (대회 EDA 반영):
 - SOG=102.3 = AIS 결측 아티팩트 → sog_invalid 플래그 + 값 제거 (음향은 정상)
 - heading==0 다수가 미보고 → head_missing 플래그 / heading>360 클리핑
 - 80% 정지 클립 → is_stop 플래그로 'AIS 신뢰도 낮음' 을 모델에 명시
-- mel npy 사전생성(scripts/precompute_mel.py) 우선 로드, 없으면 WAV fallback
+- AST fbank 사전생성(scripts/precompute_ast.py) 우선 로드, 없으면 WAV fallback
 
-config 키는 기존 configs/audio_task1.yaml 규약을 따른다
-(sample_rate / duration / n_fft / hop_length / f_min / f_max).
-GPU(torch/timm/torchaudio) 환경에서 동작.
+config 키:
+    model_name : AST model id (또는 AST_DEFAULT_ID)
+    _audio_dir : train.py 가 split 별로 주입 (train_audio / task1_audio)
+    ast_model_id : (optional) feature extractor id
+
+GPU(torch/torchaudio/transformers) 환경에서 동작.
+
+[변경 사항 - 2026-06-15]
+- AIS feature: 8-d → 14-d (drift angle, hour, sog bins 추가)
+- class_weights: inverse-freq → effective number (β=0.9999, Cui et al. 2019)
+  · 기존 inverse-freq가 C_Passenger를 과예측하게 만들어 Macro F1 32%에서 정체
+- AIS MLP 강화: hidden 64→128, BatchNorm + Dropout 추가, 3-layer
+- Fusion head 강화: 2-layer → 3-layer + BatchNorm
+- CNN(timm) 경로 제거 — AST 전용으로 단순화
 """
 import os
 import random
 import numpy as np
+import pandas as pd
 
 
 # ----------------------------------------------------------------------
-# AIS feature engineering  (정형 피처 8-dim)
+# AIS feature engineering  (정형 피처 14-dim)
 # ----------------------------------------------------------------------
 def build_ais_features(df):
     sog  = df["sog"].fillna(0).values.astype(np.float32)
@@ -34,38 +45,57 @@ def build_ais_features(df):
     head_missing = (head == 0).astype(np.float32)
     cog_r, head_r = np.deg2rad(cog), np.deg2rad(head)
 
-    return np.stack([
-        np.log1p(sog),
-        np.cos(cog_r), np.sin(cog_r),
-        np.cos(head_r), np.sin(head_r),
-        is_stop, head_missing, sog_invalid,
+    # drift angle = cog - heading (조류·바람 영향)
+    drift = ((cog - head + 180.0) % 360.0) - 180.0
+    drift_r = np.deg2rad(drift)
+
+    # SOG 구간 (작업/순항 구분 — A는 저속, D는 중속, B는 광범위)
+    sog_low  = ((sog >= 0.5) & (sog < 5)).astype(np.float32)
+    sog_mid  = ((sog >= 5) & (sog < 12)).astype(np.float32)
+    sog_high = (sog >= 12).astype(np.float32)
+
+    # hour-of-day (여객선 정기 항로 패턴)
+    ts = pd.to_datetime(df["ais_timestamp"], errors="coerce")
+    hour = ts.dt.hour.fillna(0).values.astype(np.float32)
+    hour_sin = np.sin(2 * np.pi * hour / 24).astype(np.float32)
+
+    feats = np.stack([
+        np.log1p(sog),                          # 0
+        np.cos(cog_r), np.sin(cog_r),           # 1, 2
+        np.cos(head_r), np.sin(head_r),         # 3, 4
+        is_stop, head_missing, sog_invalid,     # 5, 6, 7
+        np.cos(drift_r), np.sin(drift_r),       # 8, 9
+        sog_low, sog_mid, sog_high,             # 10, 11, 12
+        hour_sin,                                # 13
     ], axis=1).astype(np.float32)
 
+    feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+    return feats
 
-AIS_DIM = 8
 
+AIS_DIM = 14
 AST_DEFAULT_ID = "MIT/ast-finetuned-audioset-10-10-0.4593"
 
 
-def _is_ast(cfg_or_name):
-    name = cfg_or_name.get("model_name", "") if isinstance(cfg_or_name, dict) else cfg_or_name
-    return "ast" in str(name).lower()
-
-
 # ----------------------------------------------------------------------
-# AST dataset  — WAV → 16kHz → ASTFeatureExtractor (1024,128). use_npy 무시.
+# Dataset — AST fbank npy 우선, 없으면 WAV → ASTFeatureExtractor fallback
 # ----------------------------------------------------------------------
-def _make_ast_dataset(df, ais_feats, cfg, labels, train):
-    import random
+def make_dataset(df, ais_feats, cfg, labels=None, train=False):
     import torch
     from torch.utils.data import Dataset
-    import torchaudio
-    from transformers import ASTFeatureExtractor
 
     audio_dir = cfg["_audio_dir"]
-    ast_id = cfg.get("ast_model_id", AST_DEFAULT_ID)
+    npy_dir = cfg.get("ast_npy_dir", "data/ast_npy")
     ast_sr = 16000
-    fe = ASTFeatureExtractor.from_pretrained(ast_id)   # 16kHz/128mel/1024, AudioSet 정규화
+
+    # FeatureExtractor는 lazy 로드 — npy로 다 커버되면 영원히 안 불림
+    _fe_cache = {}
+    def _get_fe():
+        if "fe" not in _fe_cache:
+            from transformers import ASTFeatureExtractor
+            ast_id = cfg.get("ast_model_id", AST_DEFAULT_ID)
+            _fe_cache["fe"] = ASTFeatureExtractor.from_pretrained(ast_id)
+        return _fe_cache["fe"]
 
     class _ASTDS(Dataset):
         def __init__(self):
@@ -79,22 +109,26 @@ def _make_ast_dataset(df, ais_feats, cfg, labels, train):
             return len(self.df)
 
         def _feat(self, fn):
-            npy_path = os.path.join("data/ast_npy", fn.replace(".wav", ".npy"))
+            npy_path = os.path.join(npy_dir, fn.replace(".wav", ".npy"))
             if os.path.exists(npy_path):
+                # fp16 저장본 → fp32 텐서
                 return torch.from_numpy(np.load(npy_path)).float()
+            # fallback
+            import torchaudio
             wav, sr = torchaudio.load(os.path.join(audio_dir, fn))
             wav = wav.mean(0)
             if sr != ast_sr:
                 if sr not in self._rs:
                     self._rs[sr] = torchaudio.transforms.Resample(sr, ast_sr)
                 wav = self._rs[sr](wav)
-            out = fe(wav.numpy(), sampling_rate=ast_sr, return_tensors="pt")
+            out = _get_fe()(wav.numpy(), sampling_rate=ast_sr, return_tensors="pt")
             return out["input_values"][0]
 
         def __getitem__(self, i):
             x = self._feat(self.df.iloc[i]["filename"])
-            if self.train and random.random() < 0.5:       # 가벼운 time mask
-                t = random.randint(0, max(0, x.shape[0] - 80)); x[t:t + 80, :] = x.mean()
+            if self.train and random.random() < 0.5:
+                t = random.randint(0, max(0, x.shape[0] - 80))
+                x[t:t + 80, :] = x.mean()
             ais = torch.from_numpy(self.ais[i])
             if self.labels is not None:
                 return x, ais, torch.tensor(self.labels[i], dtype=torch.long)
@@ -104,10 +138,10 @@ def _make_ast_dataset(df, ais_feats, cfg, labels, train):
 
 
 # ----------------------------------------------------------------------
-# AST model  — ASTModel 인코더(pooler) + AIS MLP 융합. forward 시그니처는 CNN과 동일.
+# Model — ASTModel(pooler) + AIS MLP 융합
 # ----------------------------------------------------------------------
-def _create_ast_model(model_name, num_classes, pretrained,
-                      ais_dim=AIS_DIM, ais_hidden=64, proj=128):
+def create_audio_model(model_name=AST_DEFAULT_ID, num_classes=4,
+                       pretrained=True, ais_dim=AIS_DIM, ais_hidden=128, proj=128):
     import torch
     import torch.nn as nn
     from transformers import ASTModel, ASTConfig
@@ -118,17 +152,46 @@ def _create_ast_model(model_name, num_classes, pretrained,
         def __init__(self):
             super().__init__()
             self.ast = ASTModel.from_pretrained(ast_id) if pretrained else ASTModel(ASTConfig())
-            for p in self.ast.embeddings.parameters(): p.requires_grad = False
-            for p in self.ast.encoder.layer[:8].parameters(): p.requires_grad = False
+            # AST 하위 layer freeze: embeddings + 첫 8개 encoder layer
+            for p in self.ast.embeddings.parameters():
+                p.requires_grad = False
+            for p in self.ast.encoder.layer[:8].parameters():
+                p.requires_grad = False
+
             feat = self.ast.config.hidden_size            # 768
-            self.audio_proj = nn.Sequential(nn.Linear(feat, proj), nn.ReLU())
+
+            self.audio_proj = nn.Sequential(
+                nn.Linear(feat, proj),
+                nn.ReLU(),
+            )
+
+            # AIS MLP: BN + Dropout 3-layer (강화)
             self.ais_mlp = nn.Sequential(
-                nn.Linear(ais_dim, ais_hidden), nn.ReLU(),
-                nn.Linear(ais_hidden, ais_hidden), nn.ReLU())
+                nn.Linear(ais_dim, ais_hidden),
+                nn.BatchNorm1d(ais_hidden),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(ais_hidden, ais_hidden),
+                nn.BatchNorm1d(ais_hidden),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(ais_hidden, ais_hidden),
+                nn.ReLU(),
+            )
+
+            # Fusion head: 3-layer + BN (강화)
+            fused_dim = proj + ais_hidden
             self.head = nn.Sequential(
                 nn.Dropout(0.3),
-                nn.Linear(proj + ais_hidden, 128), nn.ReLU(),
-                nn.Linear(128, num_classes))
+                nn.Linear(fused_dim, 256),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+                nn.Dropout(0.3),
+                nn.Linear(256, 128),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Linear(128, num_classes),
+            )
 
         def forward(self, x, ais):                         # x: (B,1024,128)
             pooled = self.ast(input_values=x).pooler_output    # (B, 768)
@@ -140,122 +203,31 @@ def _create_ast_model(model_name, num_classes, pretrained,
 
 
 # ----------------------------------------------------------------------
-# Dataset  (mel npy 우선, WAV fallback)
+# Class weights — effective number (Cui et al. 2019)
 # ----------------------------------------------------------------------
-def make_dataset(df, ais_feats, cfg, labels=None, train=False):
-    """torch Dataset 생성 (지연 import — torch 없는 환경 보호).
+def class_weights(labels, n=4, beta=0.9999):
+    """Effective number weighting.
 
-    config 키는 audio_task1.yaml 규약(sample_rate/duration/hop_length/...) 을 따른다.
+    기존 inverse-freq (count.sum() / (n * count)) 는 train 분포 (C가 10.7%) 에서
+    C 에 5.1배 weight 를 줘서 'C 로 찍자' 부작용 발생 (val 32%, C 과예측).
+
+    Effective number 는 'unique sample 수' 개념으로 부드럽게 보정:
+        w_c ∝ (1-β) / (1-β^n_c)
+
+    β 선택 가이드 (이 데이터셋 N≈35k 기준):
+        β=0.99   → 모든 weight ≈ 1.0 (가중 없음과 동일)
+        β=0.999  → 모든 weight ≈ 1.0 (35k 규모에선 너무 약함)
+        β=0.9999 → C/A 비율 ~2.7x (기존 5.1x 의 절반, 권장 시작점)
+        β=0.99999 → C/A 비율 ~4x (강한 가중 — 부작용 다시 나타날 수 있음)
+
+    val 점수 보고 조정:
+      - C 과예측 여전 → β 낮추기 (0.9999 → 0.999)
+      - 소수 클래스 recall 너무 낮음 → β 높이기 (0.9999 → 0.99999)
     """
     import torch
-    import torch.nn.functional as F
-    from torch.utils.data import Dataset
-    import torchaudio
-
-    if _is_ast(cfg):                                # AST: 전용 16kHz fbank 경로
-        return _make_ast_dataset(df, ais_feats, cfg, labels, train)
-
-    sr        = cfg.get("sample_rate", 32000)
-    duration  = cfg.get("duration", 5.0)
-    hp_cut    = cfg.get("hp_cutoff", 20.0)
-    n_mels    = cfg.get("n_mels", 128)
-    n_fft     = cfg.get("n_fft", 2048)
-    hop       = cfg.get("hop_length", 512)
-    fmin      = cfg.get("f_min", 50)
-    fmax      = cfg.get("f_max", 16000)
-    use_npy   = cfg.get("use_npy", False)
-    mel_dir   = cfg.get("mel_dir", "data/mel_npy")
-    audio_dir = cfg["_audio_dir"]               # train.py 가 split 별로 주입
-    target    = int(sr * duration)
-
-    class _DS(Dataset):
-        def __init__(self):
-            self.df = df.reset_index(drop=True)
-            self.ais = ais_feats
-            self.labels = labels
-            self.train = train
-            if not use_npy:
-                self.melspec = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=sr, n_fft=n_fft, hop_length=hop,
-                    n_mels=n_mels, f_min=fmin, f_max=fmax)
-                self.to_db = torchaudio.transforms.AmplitudeToDB(top_db=80)
-
-        def __len__(self): return len(self.df)
-
-        def _mel(self, fn):
-            if use_npy:
-                arr = np.load(os.path.join(mel_dir, fn.replace(".wav", ".npy")))
-                mel = torch.from_numpy(arr).float()
-                if mel.dim() == 2: mel = mel.unsqueeze(0)     # (1, n_mels, T)
-                return mel
-            wav, _sr = torchaudio.load(os.path.join(audio_dir, fn))
-            if wav.shape[0] > 1: wav = wav.mean(0, keepdim=True)
-            if _sr != sr: wav = torchaudio.functional.resample(wav, _sr, sr)
-            wav = torchaudio.functional.highpass_biquad(wav, sr, hp_cut)
-            wav = F.pad(wav, (0, target - wav.shape[1])) if wav.shape[1] < target else wav[:, :target]
-            mel = self.to_db(self.melspec(wav))
-            return (mel - mel.mean()) / (mel.std() + 1e-6)
-
-        def __getitem__(self, i):
-            mel = self._mel(self.df.iloc[i]["filename"])
-            if self.train:                                    # SpecAugment
-                if random.random() < 0.5:
-                    t = random.randint(0, max(0, mel.shape[-1]-48)); mel[..., t:t+48] = mel.min()
-                if random.random() < 0.5:
-                    fch = random.randint(0, max(0, mel.shape[-2]-24)); mel[..., fch:fch+24, :] = mel.min()
-            ais = torch.from_numpy(self.ais[i])
-            if self.labels is not None:
-                return mel, ais, torch.tensor(self.labels[i], dtype=torch.long)
-            return mel, ais
-
-    return _DS()
-
-
-# ----------------------------------------------------------------------
-# Model  (timm CNN 백본 + AIS MLP 융합)
-# ----------------------------------------------------------------------
-def create_audio_model(model_name="tf_efficientnet_b0_ns", num_classes=4,
-                       pretrained=True, ais_dim=AIS_DIM, ais_hidden=64, proj=128):
-    import torch
-    import torch.nn as nn
-    import timm
-
-    if _is_ast(model_name):                         # AST: ASTModel + AIS 융합
-        return _create_ast_model(model_name, num_classes, pretrained, ais_dim=ais_dim)
-
-    class ShipNet(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.backbone = timm.create_model(
-                model_name, pretrained=pretrained, in_chans=1,
-                num_classes=0, global_pool="avg")
-            feat = self.backbone.num_features
-            self.audio_proj = nn.Sequential(nn.Linear(feat, proj), nn.ReLU())
-            self.ais_mlp = nn.Sequential(
-                nn.Linear(ais_dim, ais_hidden), nn.ReLU(),
-                nn.Linear(ais_hidden, ais_hidden), nn.ReLU())
-            self.head = nn.Sequential(
-                nn.Dropout(0.3),
-                nn.Linear(proj + ais_hidden, 128), nn.ReLU(),
-                nn.Linear(128, num_classes))
-
-        def forward(self, mel, ais):
-            a = self.audio_proj(self.backbone(mel))
-            m = self.ais_mlp(ais)
-            return self.head(torch.cat([a, m], dim=1))
-
-    return ShipNet()
-
-
-def class_weights(labels, n=4):
-    import torch
-    cnt = np.bincount(labels, minlength=n).astype(np.float32)
-    w = cnt.sum() / (n * np.maximum(cnt, 1))
+    cnt = np.bincount(labels, minlength=n).astype(np.float64)
+    cnt = np.maximum(cnt, 1.0)
+    effective_num = 1.0 - np.power(beta, cnt)
+    w = (1.0 - beta) / effective_num
+    w = w / w.sum() * n     # 평균 1로 정규화 (loss scale 유지)
     return torch.tensor(w, dtype=torch.float32)
-
-
-RECOMMENDED_BACKBONES = [
-    "tf_efficientnet_b0_ns",   # 가벼운 baseline
-    "eca_nfnet_l0",            # 음향 대회 단골
-    "convnext_small",          # 강력
-]

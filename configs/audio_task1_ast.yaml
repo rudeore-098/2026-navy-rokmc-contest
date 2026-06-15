@@ -2,8 +2,9 @@ type: audio
 task: multiclass
 
 seed: 42
-n_folds: 2
+n_folds: 5                # 2 → 5 (StratifiedGroupKFold)
 group_col: ship_id
+cv_type: stratified_group # ← 새 키 (train.py에서 splitter 선택)
 
 paths:
   train:       "data/train/train.csv"
@@ -18,15 +19,17 @@ target_col: "ship_type"
 
 sample_rate: 32000
 duration:    5.0
-use_npy:     false
+use_npy:     true         # false → true (ast_npy 우선 로드)
 
 model_name:   "ast"
 ast_model_id: "MIT/ast-finetuned-audioset-10-10-0.4593"
 pretrained:   true
-ais_dim:      8
+ais_dim:      14          # 8 → 14 (audio.py가 14-d로 강화됨, 코드와 일치)
 
-epochs:       2
-batch_size:   8
-lr:           1.0e-5
-weight_decay: 1.0e-4
-num_workers:  2
+# === Config A: baseline 안정 ===
+epochs:              12       # 2 → 12 (AST fine-tuning 적정선)
+batch_size:          16       # 8 → 16 (A100 10GB + fp16 AMP 안전선)
+lr:                  5.0e-5   # 1e-5 → 5e-5 (8 layer freeze 상태 적정)
+weight_decay:        1.0e-5   # 1e-4 → 1e-5 (lr 키운 만큼 약화)
+class_weight_beta:   0.9999   # effective number (audio.py 기본값과 일치)
+num_workers:         2
