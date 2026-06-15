@@ -23,23 +23,73 @@ def load_config(path):
         return yaml.safe_load(f)
 
 
+# ── 2단계 파인튜닝 헬퍼 ──────────────────────────────────────────────────────────
+
+def _get_backbone(model):
+    """AudioModel → backbone, ASTWrapper → ast, 그 외 → None."""
+    if hasattr(model, "backbone"):
+        return model.backbone
+    if hasattr(model, "ast"):
+        return model.ast
+    return None
+
+
+def _freeze_backbone(model):
+    bb = _get_backbone(model)
+    if bb:
+        for p in bb.parameters():
+            p.requires_grad = False
+
+
+def _unfreeze_backbone(model):
+    bb = _get_backbone(model)
+    if bb:
+        for p in bb.parameters():
+            p.requires_grad = True
+
+
+def _make_optimizer(model, lr, backbone_lr_scale=1.0, weight_decay=1e-4):
+    """백본/헤드 LR을 분리한 AdamW 옵티마이저.
+
+    backbone_lr_scale < 1.0 이면 백본에 낮은 LR 적용 (레이어별 LR 감쇠).
+    """
+    import torch
+    bb = _get_backbone(model)
+    bb_ids = {id(p) for p in bb.parameters()} if bb else set()
+
+    head_params = [p for p in model.parameters()
+                   if id(p) not in bb_ids and p.requires_grad]
+    bb_params   = [p for p in bb.parameters() if p.requires_grad] if bb else []
+
+    groups = [{"params": head_params, "lr": lr}]
+    if bb_params:
+        groups.append({"params": bb_params, "lr": lr * backbone_lr_scale})
+
+    return torch.optim.AdamW(groups, weight_decay=weight_decay)
+
+
 # ── SpecAugment ───────────────────────────────────────────────────────────────
 
 def spec_augment(spec, T: int = 40, F: int = 20, num_T: int = 2, num_F: int = 2):
-    """Batch-level SpecAugment. spec: (B, 1, n_mels, time)"""
+    """Batch-level SpecAugment (벡터화 — Python 루프 없음). spec: (B, C, n_mels, time)"""
     import torch
     B, _, n_mels, time = spec.shape
+    dev = spec.device
     spec = spec.clone()
+
+    t_idx = torch.arange(time,   device=dev).view(1, 1, 1, time)
+    f_idx = torch.arange(n_mels, device=dev).view(1, 1, n_mels, 1)
+
     for _ in range(num_T):
-        t0 = torch.randint(0, max(1, time - T), (B,))
-        tl = torch.randint(1, T + 1, (B,))
-        for b in range(B):
-            spec[b, :, :, t0[b]: t0[b] + tl[b]] = 0.0
+        t0 = torch.randint(0, max(1, time   - T), (B, 1, 1, 1), device=dev)
+        tl = torch.randint(1, T + 1,              (B, 1, 1, 1), device=dev)
+        spec.masked_fill_((t_idx >= t0) & (t_idx < t0 + tl), 0.0)
+
     for _ in range(num_F):
-        f0 = torch.randint(0, max(1, n_mels - F), (B,))
-        fl = torch.randint(1, F + 1, (B,))
-        for b in range(B):
-            spec[b, :, f0[b]: f0[b] + fl[b], :] = 0.0
+        f0 = torch.randint(0, max(1, n_mels - F), (B, 1, 1, 1), device=dev)
+        fl = torch.randint(1, F + 1,              (B, 1, 1, 1), device=dev)
+        spec.masked_fill_((f_idx >= f0) & (f_idx < f0 + fl), 0.0)
+
     return spec
 
 
@@ -189,17 +239,42 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
 
         model = create_audio_model(cfg, n_cls).to(device)
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=cfg["epochs"], eta_min=cfg["lr"] * 0.01)
+        freeze_epochs      = cfg.get("freeze_epochs", 0)
+        unfreeze_lr_scale  = cfg.get("unfreeze_lr_scale", 0.1)
+        total_epochs       = cfg["epochs"]
+        base_lr            = cfg["lr"]
+        patience           = cfg.get("patience", 5)
+
+        # Phase 1: 백본 freeze, 헤드만 학습
+        if freeze_epochs > 0:
+            _freeze_backbone(model)
+            logger.info(f"  [Phase 1] 백본 freeze — {freeze_epochs} epochs (헤드만 학습)")
+            optimizer = _make_optimizer(model, base_lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=freeze_epochs, eta_min=base_lr * 0.01)
+        else:
+            optimizer = _make_optimizer(model, base_lr)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=total_epochs, eta_min=base_lr * 0.01)
+
         scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
         best_score, best_oof_fold, patience_cnt = -np.inf, None, 0
-        patience = cfg.get("patience", 5)
 
-        epoch_bar = tqdm(range(cfg["epochs"]), desc=f"Fold {fold+1}/{n_folds}",
+        epoch_bar = tqdm(range(total_epochs), desc=f"Fold {fold+1}/{n_folds}",
                          unit="ep", dynamic_ncols=True)
         for epoch in epoch_bar:
+            # Phase 1 → Phase 2 전환
+            if freeze_epochs > 0 and epoch == freeze_epochs:
+                _unfreeze_backbone(model)
+                optimizer = _make_optimizer(model, base_lr,
+                                            backbone_lr_scale=unfreeze_lr_scale)
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=total_epochs - freeze_epochs, eta_min=base_lr * 0.01)
+                best_score, patience_cnt = -np.inf, 0   # patience 리셋
+                logger.info(f"  [Phase 2] 백본 unfreeze "
+                            f"(backbone lr={base_lr * unfreeze_lr_scale:.2e}, "
+                            f"head lr={base_lr:.2e})")
+
             loss = _train_epoch(model, tr_loader, criterion, optimizer, scaler, device,
                                 mixup_p=cfg.get("mixup_p", 0.0),
                                 mixup_alpha=cfg.get("mixup_alpha", 0.4),
@@ -208,12 +283,13 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
             score = get_metric("multiclass", va_labels, va_preds)
             scheduler.step()
             lr_now = scheduler.get_last_lr()[0]
+            phase = 1 if epoch < freeze_epochs else 2
             epoch_bar.set_postfix(
                 loss=f"{loss:.4f}", F1=f"{score:.4f}",
                 best=f"{best_score:.4f}" if best_score > -np.inf else "-",
-                lr=f"{lr_now:.2e}",
+                lr=f"{lr_now:.2e}", ph=phase,
             )
-            logger.info(f"  ep {epoch+1:3d}/{cfg['epochs']} | loss={loss:.4f} "
+            logger.info(f"  ep {epoch+1:3d}/{total_epochs} [ph{phase}] | loss={loss:.4f} "
                         f"| MacroF1={score:.4f} | lr={lr_now:.2e}")
 
             if score > best_score:
@@ -223,7 +299,7 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
             else:
                 patience_cnt += 1
                 if patience_cnt >= patience:
-                    logger.info(f"  early stop at epoch {epoch + 1}")
+                    logger.info(f"  early stop at epoch {epoch + 1} [phase {phase}]")
                     epoch_bar.close()
                     break
 
