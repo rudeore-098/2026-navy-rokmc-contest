@@ -39,7 +39,8 @@ class AudioModel(nn.Module):
 
     def __init__(self, model_name: str, num_classes: int,
                  in_chans: int = 1, pretrained: bool = True,
-                 ais_dim: int = 5, embed_dim: int = 512, drop: float = 0.2):
+                 ais_dim: int = 5, embed_dim: int = 512, drop: float = 0.2,
+                 ais_hidden: int = 64, audio_compress: int = 0):
         super().__init__()
         import timm
         self.backbone = timm.create_model(
@@ -48,9 +49,27 @@ class AudioModel(nn.Module):
         )
         feat_dim = self.backbone.num_features
 
-        self.ais_proj = nn.Linear(ais_dim, 32) if ais_dim > 0 else None
-        in_dim = feat_dim + (32 if ais_dim > 0 else 0)
+        # 음향 압축 (audio_compress > 0 이면 feat_dim → audio_compress)
+        if audio_compress > 0:
+            self.audio_compress = nn.Sequential(
+                nn.Linear(feat_dim, audio_compress), nn.ReLU())
+            audio_out = audio_compress
+        else:
+            self.audio_compress = None
+            audio_out = feat_dim
 
+        # AIS branch: ais_dim → ais_hidden → ais_hidden//2
+        if ais_dim > 0:
+            ais_out = max(ais_hidden // 2, 32)
+            self.ais_proj = nn.Sequential(
+                nn.Linear(ais_dim, ais_hidden), nn.ReLU(),
+                nn.Linear(ais_hidden, ais_out),
+            )
+        else:
+            self.ais_proj = None
+            ais_out = 0
+
+        in_dim = audio_out + ais_out
         self.embed_fc = nn.Sequential(
             nn.Dropout(drop),
             nn.Linear(in_dim, embed_dim),
@@ -61,8 +80,10 @@ class AudioModel(nn.Module):
 
     def forward(self, spec, ais=None, return_embedding: bool = False):
         x = self.backbone(spec)                                    # (B, feat_dim)
+        if self.audio_compress is not None:
+            x = self.audio_compress(x)                            # (B, audio_compress)
         if self.ais_proj is not None and ais is not None:
-            x = torch.cat([x, F.relu(self.ais_proj(ais))], dim=1)
+            x = torch.cat([x, self.ais_proj(ais)], dim=1)
         emb = self.embed_fc(x)                                     # (B, embed_dim)
         if return_embedding:
             return F.normalize(emb, dim=1)
@@ -140,4 +161,6 @@ def create_audio_model(cfg: dict, num_classes: int) -> nn.Module:
         pretrained=cfg.get("pretrained", True),
         ais_dim=ais_dim,
         embed_dim=embed_dim,
+        ais_hidden=cfg.get("ais_hidden", 64),
+        audio_compress=cfg.get("audio_compress", 0),
     )

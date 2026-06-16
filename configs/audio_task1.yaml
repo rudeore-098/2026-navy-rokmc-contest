@@ -51,10 +51,18 @@ batch_size:  32
 lr:          3.0e-4
 num_workers: 2
 
-mixup_p:         0.5     # 배치당 mixup 적용 확률
-mixup_alpha:     0.4     # Beta(α,α) — 0.4는 BirdCLEF 검증값
-label_smoothing: 0.1     # FocalLoss 내 soft target 비율
-tta_n:           3       # 추론 TTA 패스 수 (1=off, 3=±15프레임)
+focal_gamma:          1.0   # FocalLoss γ (2.0→1.0: 다수 클래스 A 학습 여지 확보)
+class_weight_sqrt:    true  # true=sqrt 스케일 완화, false=balanced (기존)
+class_weight_clip_min: 0.5  # 하한 완화 (기존 0.1 → 0.5)
+class_weight_clip_max: 5.0  # 상한 완화 (기존 10  → 5.0)
+
+ais_hidden:      64    # AIS branch 히든 차원 (7→128→64)
+audio_compress:  256   # 음향 특징 압축 차원 (2304→256, 0=비활성)
+
+mixup_p:         0.3   # 완화 (0.5→0.3)
+mixup_alpha:     0.4
+label_smoothing: 0.05  # 완화 (0.1→0.05)
+tta_n:           3
 
 # 스펙트로그램 캐시 (첫 실행에서 변환 후 .npy로 저장 → 이후 librosa 호출 없음)
 cache_spectrograms: true

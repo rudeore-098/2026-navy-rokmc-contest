@@ -230,9 +230,16 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         va_loader = _make_loader(val_df_ext, val_audio_ext, cfg, demo)
 
         cnts = np.bincount(labels, minlength=n_cls).astype(float)
-        w    = torch.tensor((cnts.sum() / (n_cls * cnts)).clip(0.1, 10),
-                            dtype=torch.float32, device=device)
-        criterion = FocalLoss(gamma=2.0, weight=w,
+        raw_w = cnts.sum() / (n_cls * cnts)
+        if cfg.get("class_weight_sqrt", False):
+            raw_w = raw_w ** 0.5
+        clip_min = cfg.get("class_weight_clip_min", 0.5)
+        clip_max = cfg.get("class_weight_clip_max", 5.0)
+        clipped  = raw_w.clip(clip_min, clip_max)
+        logger.info(f"  class weights (raw): {dict(zip(['A','B','C','D'], raw_w.round(3)))}")
+        logger.info(f"  class weights (clip {clip_min}~{clip_max}): {clipped.round(3).tolist()}")
+        w = torch.tensor(clipped, dtype=torch.float32, device=device)
+        criterion = FocalLoss(gamma=cfg.get("focal_gamma", 2.0), weight=w,
                               label_smoothing=cfg.get("label_smoothing", 0.0))
         model = create_audio_model(cfg, n_cls).to(device)
 
@@ -293,6 +300,13 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
 
         logger.info(f"best val MacroF1: {best_score:.5f}")
 
+        from sklearn.metrics import classification_report, confusion_matrix as _cm
+        cls_names = ["A_SmallWorking", "B_MotorBoat", "C_Passenger", "D_LargeShip"]
+        logger.info("── Val Confusion Matrix ──\n" + str(_cm(va_labels_ext, va_preds.argmax(axis=1))))
+        logger.info("── Val per-class F1 ──\n" +
+                    classification_report(va_labels_ext, va_preds.argmax(axis=1),
+                                          target_names=cls_names, digits=3))
+
         # test 예측
         test_df, test_audio = load_task1(cfg, "test", demo=demo)
         tta_n = cfg.get("tta_n", 1)
@@ -325,9 +339,16 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
         va_loader = _make_loader(va_df, audio_dir, cfg, demo)
 
         cnts = np.bincount(labels[tr_idx], minlength=n_cls).astype(float)
-        w    = torch.tensor((cnts.sum() / (n_cls * cnts)).clip(0.1, 10),
-                            dtype=torch.float32, device=device)
-        criterion = FocalLoss(gamma=2.0, weight=w,
+        raw_w = cnts.sum() / (n_cls * cnts)
+        if cfg.get("class_weight_sqrt", False):
+            raw_w = raw_w ** 0.5
+        clip_min = cfg.get("class_weight_clip_min", 0.5)
+        clip_max = cfg.get("class_weight_clip_max", 5.0)
+        clipped  = raw_w.clip(clip_min, clip_max)
+        logger.info(f"  class weights (raw): {dict(zip(['A','B','C','D'], raw_w.round(3)))}")
+        logger.info(f"  class weights (clip {clip_min}~{clip_max}): {clipped.round(3).tolist()}")
+        w = torch.tensor(clipped, dtype=torch.float32, device=device)
+        criterion = FocalLoss(gamma=cfg.get("focal_gamma", 2.0), weight=w,
                               label_smoothing=cfg.get("label_smoothing", 0.0))
 
         model = create_audio_model(cfg, n_cls).to(device)
@@ -401,6 +422,14 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
 
     oof_score = get_metric("multiclass", labels, oof)
     logger.info(f"OOF MacroF1: {oof_score:.5f}")
+
+    from sklearn.metrics import classification_report, confusion_matrix as _cm
+    oof_cls = oof.argmax(axis=1)
+    cls_names = ["A_SmallWorking", "B_MotorBoat", "C_Passenger", "D_LargeShip"]
+    logger.info("── OOF Confusion Matrix ──\n" + str(_cm(labels, oof_cls)))
+    logger.info("── OOF per-class F1 ──\n" +
+                classification_report(labels, oof_cls, target_names=cls_names, digits=3))
+
     np.save(os.path.join(exp_dir, "oof.npy"), oof)
     np.save(os.path.join(exp_dir, "y_true.npy"), labels)
 
