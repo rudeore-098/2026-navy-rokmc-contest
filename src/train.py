@@ -473,15 +473,19 @@ def train_audio_task1(cfg, exp_dir, demo, logger):
 # ── 체크포인트 → npy 생성 (학습 중단 후 예측만 뽑을 때) ──────────────────────
 
 def predict_only(cfg, exp_dir, demo, logger):
-    """experiments/{exp}/model_fold*.pt 로 val_pred.npy, test_pred.npy 생성."""
-    import torch
-    import glob
+    """experiments/{exp}/model_fold*.pt 로 oof/val_pred/test_pred.npy 생성.
+
+    OOF: 동일 seed로 KFold를 재현 → 각 fold 체크포인트가 해당 val 샘플만 예측.
+    체크포인트가 일부만 있으면 있는 fold만 사용.
+    """
+    import torch, glob, re
     from src.models.audio import create_audio_model
     from src.data.loaders import load_task1, SHIP_TYPE_TO_IDX
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     n_cls  = len(SHIP_TYPE_TO_IDX)
     tta_n  = cfg.get("tta_n", 1)
+    n_folds = cfg.get("n_folds", 5)
 
     ckpts = sorted(glob.glob(os.path.join(exp_dir, "model_fold*.pt")))
     if not ckpts:
@@ -490,28 +494,60 @@ def predict_only(cfg, exp_dir, demo, logger):
 
     logger.info(f"발견된 체크포인트 {len(ckpts)}개: {[os.path.basename(c) for c in ckpts]}")
 
+    # ── OOF 생성 (KFold 재현) ────────────────────────────────────────────────
+    train_df, audio_dir = load_task1(cfg, "train", demo=demo)
+    labels = train_df["ship_type"].map(SHIP_TYPE_TO_IDX).values
+    groups = train_df["ship_id"].values
+    oof    = np.zeros((len(train_df), n_cls), dtype=np.float32)
+
+    folder = get_folder("multiclass", n_folds, cfg["seed"], group=True)
+    model  = create_audio_model(cfg, n_cls).to(device)
+
+    for fold, (_, va_idx) in enumerate(cv_split(folder, train_df, labels, groups)):
+        ckpt = os.path.join(exp_dir, f"model_fold{fold}.pt")
+        if not os.path.exists(ckpt):
+            logger.info(f"  fold{fold}: 체크포인트 없음 → 건너뜀")
+            continue
+        va_df = train_df.iloc[va_idx].reset_index(drop=True)
+        model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
+        oof[va_idx] = _predict_tta(
+            model, _make_loader(va_df, audio_dir, cfg, demo, is_test=True),
+            device, n_tta=tta_n, desc=f"  fold{fold} oof")
+        oof_fold = get_metric("multiclass", labels[va_idx], oof[va_idx])
+        logger.info(f"  fold{fold} OOF MacroF1: {oof_fold:.5f}")
+
+    filled = (oof.sum(axis=1) > 0)
+    if filled.any():
+        oof_score = get_metric("multiclass", labels[filled], oof[filled])
+        logger.info(f"OOF MacroF1 ({filled.sum()}샘플): {oof_score:.5f}")
+        np.save(os.path.join(exp_dir, "oof.npy"),    oof)
+        np.save(os.path.join(exp_dir, "y_true.npy"), labels)
+        logger.info(f"저장: {exp_dir}/oof.npy, y_true.npy")
+
+    # ── val / test 예측 ──────────────────────────────────────────────────────
     val_df,  val_audio  = load_task1(cfg, "val",  demo=demo)
     test_df, test_audio = load_task1(cfg, "test", demo=demo)
     val_preds  = np.zeros((len(val_df),  n_cls), dtype=np.float32)
     test_preds = np.zeros((len(test_df), n_cls), dtype=np.float32)
+    loaded = 0
 
-    model = create_audio_model(cfg, n_cls).to(device)
-    for ckpt in tqdm(ckpts, desc="predict", unit="fold", dynamic_ncols=True):
+    for ckpt in tqdm(ckpts, desc="val/test predict", unit="fold", dynamic_ncols=True):
         model.load_state_dict(torch.load(ckpt, map_location=device, weights_only=True))
         val_preds  += _predict_tta(model, _make_loader(val_df,  val_audio,  cfg, demo, is_test=True),
                                    device, n_tta=tta_n, desc=f"  {os.path.basename(ckpt)} val")
         test_preds += _predict_tta(model, _make_loader(test_df, test_audio, cfg, demo, is_test=True),
                                    device, n_tta=tta_n, desc=f"  {os.path.basename(ckpt)} test")
+        loaded += 1
 
-    val_preds  /= len(ckpts)
-    test_preds /= len(ckpts)
+    val_preds  /= loaded
+    test_preds /= loaded
 
     np.save(os.path.join(exp_dir, "val_pred.npy"),  val_preds)
     np.save(os.path.join(exp_dir, "test_pred.npy"), test_preds)
 
     val_score = get_metric("multiclass",
                            val_df["ship_type"].map(SHIP_TYPE_TO_IDX).values, val_preds)
-    logger.info(f"val MacroF1: {val_score:.5f}  ({len(ckpts)} ckpt 평균)")
+    logger.info(f"val MacroF1: {val_score:.5f}")
     logger.info(f"저장: {exp_dir}/val_pred.npy, test_pred.npy")
 
 
