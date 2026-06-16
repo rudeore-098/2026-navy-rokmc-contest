@@ -20,8 +20,8 @@ class FocalLoss(nn.Module):
         ce = F.cross_entropy(logits, targets, weight=self.weight,
                              label_smoothing=self.label_smoothing,
                              reduction="none")
-        p_t = torch.exp(-ce)
-        return ((1 - p_t) ** self.gamma * ce).mean()
+        pt = torch.exp(-ce).clamp(min=1e-7, max=1.0)  # 언더플로/오버플로 가드
+        return ((1 - pt) ** self.gamma * ce).mean()
 
 
 class AudioModel(nn.Module):

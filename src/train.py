@@ -121,11 +121,16 @@ def _train_epoch(model, loader, criterion, optimizer, scaler, device, augment=Tr
             spec, ais, mix_idx, lam = mixup_data(spec, ais, alpha=mixup_alpha)
         optimizer.zero_grad()
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            out = model(spec, ais)
-            if use_mix:
-                loss = lam * criterion(out, label) + (1 - lam) * criterion(out, label[mix_idx])
-            else:
-                loss = criterion(out, label)
+            out = model(spec, ais)          # logits: fp16
+        # loss는 autocast 밖 fp32로 계산 (AMP + FocalLoss exp() NaN 방지)
+        if use_mix:
+            loss = lam * criterion(out.float(), label) + \
+                   (1 - lam) * criterion(out.float(), label[mix_idx])
+        else:
+            loss = criterion(out.float(), label)
+        if not torch.isfinite(loss):        # NaN/Inf 배치 스킵
+            optimizer.zero_grad()
+            continue
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
